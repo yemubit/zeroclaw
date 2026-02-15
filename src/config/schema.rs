@@ -2,6 +2,7 @@ use crate::security::AutonomyLevel;
 use anyhow::{Context, Result};
 use directories::UserDirs;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -63,6 +64,22 @@ pub struct Config {
 
     #[serde(default)]
     pub identity: IdentityConfig,
+
+    /// Named delegate agents for agent-to-agent handoff.
+    ///
+    /// ```toml
+    /// [agents.researcher]
+    /// provider = "gemini"
+    /// model = "gemini-2.0-flash"
+    /// system_prompt = "You are a research assistant..."
+    ///
+    /// [agents.coder]
+    /// provider = "openrouter"
+    /// model = "anthropic/claude-sonnet-4-20250514"
+    /// system_prompt = "You are a coding assistant..."
+    /// ```
+    #[serde(default)]
+    pub agents: HashMap<String, DelegateAgentConfig>,
 }
 
 // ── Identity (AIEOS / OpenClaw format) ──────────────────────────
@@ -92,6 +109,35 @@ impl Default for IdentityConfig {
             aieos_inline: None,
         }
     }
+}
+
+// ── Agent delegation ─────────────────────────────────────────────
+
+/// Configuration for a named delegate agent that can be invoked via the
+/// `delegate` tool. Each agent uses its own provider/model combination
+/// and system prompt, enabling multi-agent workflows with specialization.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DelegateAgentConfig {
+    /// Provider name (e.g. "gemini", "openrouter", "ollama")
+    pub provider: String,
+    /// Model identifier for the provider
+    pub model: String,
+    /// System prompt defining the agent's role and capabilities
+    #[serde(default)]
+    pub system_prompt: Option<String>,
+    /// Optional API key override (uses default if not set)
+    #[serde(default)]
+    pub api_key: Option<String>,
+    /// Temperature override (uses 0.7 if not set)
+    #[serde(default)]
+    pub temperature: Option<f64>,
+    /// Maximum delegation depth to prevent infinite recursion (default: 3)
+    #[serde(default = "default_max_delegation_depth")]
+    pub max_depth: u32,
+}
+
+fn default_max_delegation_depth() -> u32 {
+    3
 }
 
 // ── Gateway security ─────────────────────────────────────────────
@@ -831,6 +877,7 @@ impl Default for Config {
             secrets: SecretsConfig::default(),
             browser: BrowserConfig::default(),
             identity: IdentityConfig::default(),
+            agents: HashMap::new(),
         }
     }
 }
@@ -1141,6 +1188,7 @@ mod tests {
             secrets: SecretsConfig::default(),
             browser: BrowserConfig::default(),
             identity: IdentityConfig::default(),
+            agents: HashMap::new(),
         };
 
         let toml_str = toml::to_string_pretty(&config).unwrap();
@@ -1212,6 +1260,7 @@ default_temperature = 0.7
             secrets: SecretsConfig::default(),
             browser: BrowserConfig::default(),
             identity: IdentityConfig::default(),
+            agents: HashMap::new(),
         };
 
         config.save().unwrap();
@@ -1965,5 +2014,81 @@ default_temperature = 0.7
         assert!(g.require_pairing);
         assert!(!g.allow_public_bind);
         assert!(g.paired_tokens.is_empty());
+    }
+
+    // ══════════════════════════════════════════════════════════
+    // AGENT DELEGATION CONFIG TESTS
+    // ══════════════════════════════════════════════════════════
+
+    #[test]
+    fn agents_config_default_empty() {
+        let c = Config::default();
+        assert!(c.agents.is_empty());
+    }
+
+    #[test]
+    fn agents_config_backward_compat_missing_section() {
+        let minimal = r#"
+workspace_dir = "/tmp/ws"
+config_path = "/tmp/config.toml"
+default_temperature = 0.7
+"#;
+        let parsed: Config = toml::from_str(minimal).unwrap();
+        assert!(parsed.agents.is_empty());
+    }
+
+    #[test]
+    fn agents_config_toml_roundtrip() {
+        let toml_str = r#"
+default_temperature = 0.7
+
+[agents.researcher]
+provider = "gemini"
+model = "gemini-2.0-flash"
+system_prompt = "You are a research assistant."
+max_depth = 2
+
+[agents.coder]
+provider = "openrouter"
+model = "anthropic/claude-sonnet-4-20250514"
+"#;
+        let parsed: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(parsed.agents.len(), 2);
+
+        let researcher = &parsed.agents["researcher"];
+        assert_eq!(researcher.provider, "gemini");
+        assert_eq!(researcher.model, "gemini-2.0-flash");
+        assert_eq!(
+            researcher.system_prompt.as_deref(),
+            Some("You are a research assistant.")
+        );
+        assert_eq!(researcher.max_depth, 2);
+        assert!(researcher.api_key.is_none());
+        assert!(researcher.temperature.is_none());
+
+        let coder = &parsed.agents["coder"];
+        assert_eq!(coder.provider, "openrouter");
+        assert_eq!(coder.model, "anthropic/claude-sonnet-4-20250514");
+        assert!(coder.system_prompt.is_none());
+        assert_eq!(coder.max_depth, 3); // default
+    }
+
+    #[test]
+    fn agents_config_with_api_key_and_temperature() {
+        let toml_str = r#"
+[agents.fast]
+provider = "groq"
+model = "llama-3.3-70b-versatile"
+api_key = "gsk-test-key"
+temperature = 0.3
+"#;
+        let parsed: HashMap<String, DelegateAgentConfig> = toml::from_str::<toml::Value>(toml_str)
+            .unwrap()["agents"]
+            .clone()
+            .try_into()
+            .unwrap();
+        let fast = &parsed["fast"];
+        assert_eq!(fast.api_key.as_deref(), Some("gsk-test-key"));
+        assert!((fast.temperature.unwrap() - 0.3).abs() < f64::EPSILON);
     }
 }
