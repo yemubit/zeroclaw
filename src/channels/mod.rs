@@ -24,6 +24,7 @@ use crate::config::Config;
 use crate::memory::{self, Memory};
 use crate::providers::{self, Provider};
 use crate::util::truncate_with_ellipsis;
+use crate::identity;
 use anyhow::Result;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -188,11 +189,11 @@ pub fn build_system_prompt(
 
     // Check if AIEOS identity is configured
     if let Some(config) = identity_config {
-        if zeroclaw::identity::is_aieos_configured(config) {
+        if identity::is_aieos_configured(config) {
             // Load AIEOS identity
-            match zeroclaw::identity::load_aieos_identity(config, workspace_dir) {
+            match identity::load_aieos_identity(config, workspace_dir) {
                 Ok(Some(aieos_identity)) => {
-                    let aieos_prompt = zeroclaw::identity::aieos_to_system_prompt(&aieos_identity);
+                    let aieos_prompt = identity::aieos_to_system_prompt(&aieos_identity);
                     if !aieos_prompt.is_empty() {
                         prompt.push_str(&aieos_prompt);
                         prompt.push_str("\n\n");
@@ -1078,9 +1079,9 @@ mod tests {
         let ws = make_workspace();
         let prompt = build_system_prompt(ws.path(), "model", &[], &[], Some(&config));
 
-        // Should fall back to OpenClaw format
+        // Should fall back to OpenClaw format when AIEOS file is not found
+        // (Error is logged to stderr with filename, not included in prompt)
         assert!(prompt.contains("### SOUL.md"));
-        assert!(prompt.contains("[File not found: nonexistent.json]"));
     }
 
     #[test]
