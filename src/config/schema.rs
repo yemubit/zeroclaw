@@ -943,22 +943,34 @@ impl Config {
             // Set computed paths that are skipped during serialization
             config.config_path = config_path.clone();
             config.workspace_dir = zeroclaw_dir.join("workspace");
+            config.apply_env_overrides();
             Ok(config)
         } else {
             let mut config = Config::default();
             config.config_path = config_path.clone();
             config.workspace_dir = zeroclaw_dir.join("workspace");
             config.save()?;
+            config.apply_env_overrides();
             Ok(config)
         }
     }
 
     /// Apply environment variable overrides to config
     pub fn apply_env_overrides(&mut self) {
-        // API Key: ZEROCLAW_API_KEY or API_KEY
+        // API Key: ZEROCLAW_API_KEY or API_KEY (generic)
         if let Ok(key) = std::env::var("ZEROCLAW_API_KEY").or_else(|_| std::env::var("API_KEY")) {
             if !key.is_empty() {
                 self.api_key = Some(key);
+            }
+        }
+        // API Key: GLM_API_KEY overrides when provider is glm (provider-specific)
+        if self.default_provider.as_deref() == Some("glm")
+            || self.default_provider.as_deref() == Some("zhipu")
+        {
+            if let Ok(key) = std::env::var("GLM_API_KEY") {
+                if !key.is_empty() {
+                    self.api_key = Some(key);
+                }
             }
         }
 

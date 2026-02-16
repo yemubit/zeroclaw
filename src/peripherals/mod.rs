@@ -67,22 +67,37 @@ pub fn handle_command(cmd: crate::PeripheralCommands, config: &Config) -> Result
             }
         }
         crate::PeripheralCommands::Add { board, path } => {
-            println!("Adding peripheral: {} at {}", board, path);
-            println!("(Config update not yet implemented — add manually to config.toml)");
-            println!();
-            println!("Add to config.toml:");
-            println!("  [peripherals]");
-            println!("  enabled = true");
-            println!();
-            println!("  [[peripherals.boards]]");
-            println!("  board = \"{}\"", board);
-            println!(
-                "  transport = \"{}\"",
-                if path == "native" { "native" } else { "serial" }
-            );
-            if path != "native" {
-                println!("  path = \"{}\"", path);
+            let transport = if path == "native" {
+                "native"
+            } else {
+                "serial"
+            };
+            let path_opt = if path == "native" {
+                None
+            } else {
+                Some(path.clone())
+            };
+
+            let mut cfg = crate::config::Config::load_or_init()?;
+            cfg.peripherals.enabled = true;
+
+            if cfg.peripherals
+                .boards
+                .iter()
+                .any(|b| b.board == board && b.path.as_deref() == path_opt.as_deref())
+            {
+                println!("Board {} at {:?} already configured.", board, path_opt);
+                return Ok(());
             }
+
+            cfg.peripherals.boards.push(PeripheralBoardConfig {
+                board: board.clone(),
+                transport: transport.to_string(),
+                path: path_opt,
+                baud: 115200,
+            });
+            cfg.save()?;
+            println!("Added {} at {}. Restart daemon to apply.", board, path);
         }
         #[cfg(feature = "hardware")]
         crate::PeripheralCommands::Flash { port } => {
@@ -196,7 +211,8 @@ pub async fn create_peripheral_tools(config: &PeripheralsConfig) -> Result<Vec<B
     if !tools.is_empty() {
         let board_names: Vec<String> = config.boards.iter().map(|b| b.board.clone()).collect();
         tools.push(Box::new(HardwareMemoryMapTool::new(board_names.clone())));
-        tools.push(Box::new(crate::tools::HardwareBoardInfoTool::new(board_names)));
+        tools.push(Box::new(crate::tools::HardwareBoardInfoTool::new(board_names.clone())));
+        tools.push(Box::new(crate::tools::HardwareMemoryReadTool::new(board_names)));
     }
 
     // Phase C: Add hardware_capabilities tool when any serial boards

@@ -97,6 +97,9 @@ tokio-serial = { version = "5", default-features = false, optional = true }
 # probe-rs for STM32/Nucleo memory read (Phase B)
 probe-rs = { version = "0.24", optional = true }
 
+# PDF extraction for datasheet RAG (optional, enable with --features rag-pdf)
+pdf-extract = { version = "0.10", optional = true }
+
 # Raspberry Pi GPIO (Linux/RPi only) — target-specific to avoid compile failure on macOS
 [target.'cfg(target_os = "linux")'.dependencies]
 rppal = { version = "0.14", optional = true }
@@ -107,6 +110,8 @@ hardware = ["nusb", "tokio-serial"]
 peripheral-rpi = ["rppal"]
 # probe = probe-rs for Nucleo memory read (adds ~50 deps; optional)
 probe = ["dep:probe-rs"]
+# rag-pdf = PDF ingestion for datasheet RAG
+rag-pdf = ["dep:pdf-extract"]
 
 [profile.release]
 opt-level = "z"      # Optimize for size

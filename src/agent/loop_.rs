@@ -58,6 +58,7 @@ async fn build_context(mem: &dyn Memory, user_msg: &str) -> String {
 }
 
 /// Build hardware datasheet context from RAG when peripherals are enabled.
+/// Includes pin-alias lookup (e.g. "red_led" → 13) when query matches, plus retrieved chunks.
 fn build_hardware_context(
     rag: &crate::rag::HardwareRag,
     user_msg: &str,
@@ -68,13 +69,22 @@ fn build_hardware_context(
         return String::new();
     }
 
+    let mut context = String::new();
+
+    // Pin aliases: when user says "red led", inject "red_led: 13" for matching boards
+    let pin_ctx = rag.pin_alias_context(user_msg, boards);
+    if !pin_ctx.is_empty() {
+        context.push_str(&pin_ctx);
+    }
+
     let chunks = rag.retrieve(user_msg, boards, chunk_limit);
-    if chunks.is_empty() {
+    if chunks.is_empty() && pin_ctx.is_empty() {
         return String::new();
     }
 
-    let mut context = String::new();
-    context.push_str("[Hardware documentation]\n");
+    if !chunks.is_empty() {
+        context.push_str("[Hardware documentation]\n");
+    }
     for chunk in chunks {
         let board_tag = chunk.board.as_deref().unwrap_or("generic");
         let _ = writeln!(
@@ -430,6 +440,10 @@ pub async fn run(
             "Return full board info (chip, architecture, memory map) for connected hardware. Use when: user asks for 'board info', 'what board do I have', 'connected hardware', 'chip info', or 'what hardware'.",
         ));
         tool_descs.push((
+            "hardware_memory_read",
+            "Read actual memory/register values from Nucleo via USB. Use when: user asks to 'read register values', 'read memory', 'dump lower memory 0-126', 'give address and value'. Params: address (hex, default 0x20000000), length (bytes, default 128).",
+        ));
+        tool_descs.push((
             "hardware_capabilities",
             "Query connected hardware for reported GPIO pins and LED pin. Use when: user asks what pins are available.",
         ));
@@ -676,6 +690,10 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         tool_descs.push((
             "hardware_board_info",
             "Return full board info (chip, architecture, memory map). Use when user asks for board info, what board, connected hardware, or chip info.",
+        ));
+        tool_descs.push((
+            "hardware_memory_read",
+            "Read actual memory/register values from Nucleo. Use when user asks to read registers, read memory, dump lower memory 0-126, or give address and value.",
         ));
         tool_descs.push((
             "hardware_capabilities",

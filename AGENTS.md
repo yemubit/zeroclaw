@@ -24,6 +24,7 @@ Key extension points:
 - `src/memory/traits.rs` (`Memory`)
 - `src/observability/traits.rs` (`Observer`)
 - `src/runtime/traits.rs` (`RuntimeAdapter`)
+- `src/peripherals/traits.rs` (`Peripheral`) — hardware boards (STM32, RPi GPIO)
 
 ## 2) Repository Map (High-Level)
 
@@ -37,6 +38,7 @@ Key extension points:
 - `src/providers/` — model providers and resilient wrapper
 - `src/channels/` — Telegram/Discord/Slack/etc channels
 - `src/tools/` — tool execution surface (shell, file, memory, browser)
+- `src/peripherals/` — hardware peripherals (STM32, RPi GPIO); see `docs/hardware-peripherals-design.md`
 - `src/runtime/` — runtime adapters (currently native)
 - `docs/` — architecture + process docs
 - `.github/` — CI, templates, automation workflows
@@ -97,7 +99,14 @@ Key extension points:
 - Validate and sanitize all inputs.
 - Return structured `ToolResult`; avoid panics in runtime path.
 
-### 5.4 Security / Runtime / Gateway Changes
+### 5.4 Adding a Peripheral
+
+- Implement `Peripheral` in `src/peripherals/`.
+- Peripherals expose `tools()` — each tool delegates to the hardware (GPIO, sensors, etc.).
+- Register board type in config schema if needed.
+- See `docs/hardware-peripherals-design.md` for protocol and firmware notes.
+
+### 5.5 Security / Runtime / Gateway Changes
 
 - Include threat/risk notes and rollback strategy.
 - Add or update tests for boundary checks and failure modes.
