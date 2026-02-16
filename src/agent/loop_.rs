@@ -629,21 +629,26 @@ pub async fn run(
     }
 
     // ── Tools (including memory tools and peripherals) ────────────
-    let composio_key = if config.composio.enabled {
-        config.composio.api_key.as_deref()
+    let (composio_key, composio_entity_id) = if config.composio.enabled {
+        (
+            config.composio.api_key.as_deref(),
+            Some(config.composio.entity_id.as_str()),
+        )
     } else {
-        None
+        (None, None)
     };
     let mut tools_registry = tools::all_tools_with_runtime(
         &security,
         runtime,
         mem.clone(),
         composio_key,
+        composio_entity_id,
         &config.browser,
         &config.http_request,
         &config.workspace_dir,
         &config.agents,
         config.api_key.as_deref(),
+        &config,
     );
 
     let peripheral_tools: Vec<Box<dyn Tool>> =
@@ -742,7 +747,17 @@ pub async fn run(
     if config.composio.enabled {
         tool_descs.push((
             "composio",
-            "Execute actions on 1000+ apps via Composio (Gmail, Notion, GitHub, Slack, etc.). Use action='list' to discover, 'execute' to run, 'connect' to OAuth.",
+            "Execute actions on 1000+ apps via Composio (Gmail, Notion, GitHub, Slack, etc.). Use action='list' to discover, 'execute' to run (optionally with connected_account_id), 'connect' to OAuth.",
+        ));
+    }
+    tool_descs.push((
+        "schedule",
+        "Manage scheduled tasks (create/list/get/cancel/pause/resume). Supports recurring cron and one-shot delays.",
+    ));
+    if !config.agents.is_empty() {
+        tool_descs.push((
+            "delegate",
+            "Delegate a sub-task to a specialized agent. Use when: task needs different model/capability, or to parallelize work.",
         ));
     }
     if config.peripherals.enabled && !config.peripherals.boards.is_empty() {
@@ -956,21 +971,26 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         config.api_key.as_deref(),
     )?);
 
-    let composio_key = if config.composio.enabled {
-        config.composio.api_key.as_deref()
+    let (composio_key, composio_entity_id) = if config.composio.enabled {
+        (
+            config.composio.api_key.as_deref(),
+            Some(config.composio.entity_id.as_str()),
+        )
     } else {
-        None
+        (None, None)
     };
     let mut tools_registry = tools::all_tools_with_runtime(
         &security,
         runtime,
         mem.clone(),
         composio_key,
+        composio_entity_id,
         &config.browser,
         &config.http_request,
         &config.workspace_dir,
         &config.agents,
         config.api_key.as_deref(),
+        &config,
     );
     let peripheral_tools: Vec<Box<dyn Tool>> =
         crate::peripherals::create_peripheral_tools(&config.peripherals).await?;

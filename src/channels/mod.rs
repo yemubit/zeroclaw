@@ -20,7 +20,7 @@ pub use telegram::TelegramChannel;
 pub use traits::Channel;
 pub use whatsapp::WhatsAppChannel;
 
-use crate::agent::loop_::{agent_turn, build_tool_instructions};
+use crate::agent::loop_::{build_tool_instructions, run_tool_call_loop};
 use crate::config::Config;
 use crate::identity;
 use crate::memory::{self, Memory};
@@ -183,12 +183,12 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
 
     let llm_result = tokio::time::timeout(
         Duration::from_secs(CHANNEL_MESSAGE_TIMEOUT_SECS),
-        agent_turn(
+        run_tool_call_loop(
             ctx.provider.as_ref(),
             &mut history,
             ctx.tools_registry.as_ref(),
             ctx.observer.as_ref(),
-            ctx.provider_name.as_str(),
+            "channels",
             ctx.model.as_str(),
             ctx.temperature,
             true, // silent — channels don't write to stdout
@@ -729,7 +729,8 @@ pub async fn start_channels(config: Config) -> Result<()> {
     let provider_name = config
         .default_provider
         .clone()
-        .unwrap_or_else(|| "openrouter".to_string());
+        .unwrap_or_else(|| "openrouter".into());
+
     let provider: Arc<dyn Provider> = Arc::from(providers::create_resilient_provider(
         provider_name.as_str(),
         config.api_key.as_deref(),
@@ -762,21 +763,26 @@ pub async fn start_channels(config: Config) -> Result<()> {
         config.api_key.as_deref(),
     )?);
 
-    let composio_key = if config.composio.enabled {
-        config.composio.api_key.as_deref()
+    let (composio_key, composio_entity_id) = if config.composio.enabled {
+        (
+            config.composio.api_key.as_deref(),
+            Some(config.composio.entity_id.as_str()),
+        )
     } else {
-        None
+        (None, None)
     };
     let tools_registry = Arc::new(tools::all_tools_with_runtime(
         &security,
         runtime,
         Arc::clone(&mem),
         composio_key,
+        composio_entity_id,
         &config.browser,
         &config.http_request,
         &config.workspace_dir,
         &config.agents,
         config.api_key.as_deref(),
+        &config,
     ));
 
     // Build system prompt from workspace identity files + skills
@@ -820,9 +826,13 @@ pub async fn start_channels(config: Config) -> Result<()> {
     if config.composio.enabled {
         tool_descs.push((
             "composio",
-            "Execute actions on 1000+ apps via Composio (Gmail, Notion, GitHub, Slack, etc.). Use action='list' to discover, 'execute' to run, 'connect' to OAuth.",
+            "Execute actions on 1000+ apps via Composio (Gmail, Notion, GitHub, Slack, etc.). Use action='list' to discover, 'execute' to run (optionally with connected_account_id), 'connect' to OAuth.",
         ));
     }
+    tool_descs.push((
+        "schedule",
+        "Manage scheduled tasks (create/list/get/cancel/pause/resume). Supports recurring cron and one-shot delays.",
+    ));
     if !config.agents.is_empty() {
         tool_descs.push((
             "delegate",

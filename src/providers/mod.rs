@@ -221,7 +221,10 @@ pub fn create_provider(name: &str, api_key: Option<&str>) -> anyhow::Result<Box<
             "GLM", "https://api.z.ai/api/paas/v4", key, AuthStyle::Bearer,
         ))),
         "minimax" => Ok(Box::new(OpenAiCompatibleProvider::new(
-            "MiniMax", "https://api.minimax.chat", key, AuthStyle::Bearer,
+            "MiniMax",
+            "https://api.minimaxi.com/v1",
+            key,
+            AuthStyle::Bearer,
         ))),
         "bedrock" | "aws-bedrock" => Ok(Box::new(OpenAiCompatibleProvider::new(
             "Amazon Bedrock",
@@ -250,7 +253,7 @@ pub fn create_provider(name: &str, api_key: Option<&str>) -> anyhow::Result<Box<
             "Together AI", "https://api.together.xyz", key, AuthStyle::Bearer,
         ))),
         "fireworks" | "fireworks-ai" => Ok(Box::new(OpenAiCompatibleProvider::new(
-            "Fireworks AI", "https://api.fireworks.ai/inference", key, AuthStyle::Bearer,
+            "Fireworks AI", "https://api.fireworks.ai/inference/v1", key, AuthStyle::Bearer,
         ))),
         "perplexity" => Ok(Box::new(OpenAiCompatibleProvider::new(
             "Perplexity", "https://api.perplexity.ai", key, AuthStyle::Bearer,
@@ -338,11 +341,15 @@ pub fn create_resilient_provider(
         }
     }
 
-    Ok(Box::new(ReliableProvider::new(
+    let reliable = ReliableProvider::new(
         providers,
         reliability.provider_retries,
         reliability.provider_backoff_ms,
-    )))
+    )
+    .with_api_keys(reliability.api_keys.clone())
+    .with_model_fallbacks(reliability.model_fallbacks.clone());
+
+    Ok(Box::new(reliable))
 }
 
 /// Create a RouterProvider if model routes are configured, otherwise return a
@@ -704,6 +711,8 @@ mod tests {
                 "openai".into(),
                 "openai".into(),
             ],
+            api_keys: Vec::new(),
+            model_fallbacks: std::collections::HashMap::new(),
             channel_initial_backoff_secs: 2,
             channel_max_backoff_secs: 60,
             scheduler_poll_secs: 15,

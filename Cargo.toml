@@ -124,10 +124,10 @@ rag-pdf = ["dep:pdf-extract"]
 
 [profile.release]
 opt-level = "z"      # Optimize for size
-lto = true          # Link-time optimization
-codegen-units = 1   # Better optimization
-strip = true        # Remove debug symbols
-panic = "abort"     # Reduce binary size
+lto = "thin"         # Lower memory use during release builds
+codegen-units = 8     # Faster, lower-RAM codegen for small devices
+strip = true          # Remove debug symbols
+panic = "abort"      # Reduce binary size
 
 [profile.dist]
 inherits = "release"

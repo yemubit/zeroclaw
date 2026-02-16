@@ -34,6 +34,9 @@ pub struct Config {
     #[serde(default)]
     pub reliability: ReliabilityConfig,
 
+    #[serde(default)]
+    pub scheduler: SchedulerConfig,
+
     /// Model routing rules — route `hint:<name>` to specific provider+model combos.
     #[serde(default)]
     pub model_routes: Vec<ModelRouteConfig>,
@@ -67,6 +70,9 @@ pub struct Config {
 
     #[serde(default)]
     pub identity: IdentityConfig,
+
+    #[serde(default)]
+    pub cost: CostConfig,
 
     #[serde(default)]
     pub peripherals: PeripheralsConfig,
@@ -230,6 +236,147 @@ impl Default for IdentityConfig {
             aieos_inline: None,
         }
     }
+}
+
+// ── Cost tracking and budget enforcement ───────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CostConfig {
+    /// Enable cost tracking (default: false)
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Daily spending limit in USD (default: 10.00)
+    #[serde(default = "default_daily_limit")]
+    pub daily_limit_usd: f64,
+
+    /// Monthly spending limit in USD (default: 100.00)
+    #[serde(default = "default_monthly_limit")]
+    pub monthly_limit_usd: f64,
+
+    /// Warn when spending reaches this percentage of limit (default: 80)
+    #[serde(default = "default_warn_percent")]
+    pub warn_at_percent: u8,
+
+    /// Allow requests to exceed budget with --override flag (default: false)
+    #[serde(default)]
+    pub allow_override: bool,
+
+    /// Per-model pricing (USD per 1M tokens)
+    #[serde(default)]
+    pub prices: std::collections::HashMap<String, ModelPricing>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelPricing {
+    /// Input price per 1M tokens
+    #[serde(default)]
+    pub input: f64,
+
+    /// Output price per 1M tokens
+    #[serde(default)]
+    pub output: f64,
+}
+
+fn default_daily_limit() -> f64 {
+    10.0
+}
+
+fn default_monthly_limit() -> f64 {
+    100.0
+}
+
+fn default_warn_percent() -> u8 {
+    80
+}
+
+impl Default for CostConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            daily_limit_usd: default_daily_limit(),
+            monthly_limit_usd: default_monthly_limit(),
+            warn_at_percent: default_warn_percent(),
+            allow_override: false,
+            prices: get_default_pricing(),
+        }
+    }
+}
+
+/// Default pricing for popular models (USD per 1M tokens)
+fn get_default_pricing() -> std::collections::HashMap<String, ModelPricing> {
+    let mut prices = std::collections::HashMap::new();
+
+    // Anthropic models
+    prices.insert(
+        "anthropic/claude-sonnet-4-20250514".into(),
+        ModelPricing {
+            input: 3.0,
+            output: 15.0,
+        },
+    );
+    prices.insert(
+        "anthropic/claude-opus-4-20250514".into(),
+        ModelPricing {
+            input: 15.0,
+            output: 75.0,
+        },
+    );
+    prices.insert(
+        "anthropic/claude-3.5-sonnet".into(),
+        ModelPricing {
+            input: 3.0,
+            output: 15.0,
+        },
+    );
+    prices.insert(
+        "anthropic/claude-3-haiku".into(),
+        ModelPricing {
+            input: 0.25,
+            output: 1.25,
+        },
+    );
+
+    // OpenAI models
+    prices.insert(
+        "openai/gpt-4o".into(),
+        ModelPricing {
+            input: 5.0,
+            output: 15.0,
+        },
+    );
+    prices.insert(
+        "openai/gpt-4o-mini".into(),
+        ModelPricing {
+            input: 0.15,
+            output: 0.60,
+        },
+    );
+    prices.insert(
+        "openai/o1-preview".into(),
+        ModelPricing {
+            input: 15.0,
+            output: 60.0,
+        },
+    );
+
+    // Google models
+    prices.insert(
+        "google/gemini-2.0-flash".into(),
+        ModelPricing {
+            input: 0.10,
+            output: 0.40,
+        },
+    );
+    prices.insert(
+        "google/gemini-1.5-pro".into(),
+        ModelPricing {
+            input: 1.25,
+            output: 5.0,
+        },
+    );
+
+    prices
 }
 
 // ── Peripherals (hardware: STM32, RPi GPIO, etc.) ────────────────────────
@@ -773,6 +920,14 @@ pub struct ReliabilityConfig {
     /// Fallback provider chain (e.g. `["anthropic", "openai"]`).
     #[serde(default)]
     pub fallback_providers: Vec<String>,
+    /// Additional API keys for round-robin rotation on rate-limit (429) errors.
+    /// The primary `api_key` is always tried first; these are extras.
+    #[serde(default)]
+    pub api_keys: Vec<String>,
+    /// Per-model fallback chains. When a model fails, try these alternatives in order.
+    /// Example: `{ "claude-opus-4-20250514" = ["claude-sonnet-4-20250514", "gpt-4o"] }`
+    #[serde(default)]
+    pub model_fallbacks: std::collections::HashMap<String, Vec<String>>,
     /// Initial backoff for channel/daemon restarts.
     #[serde(default = "default_channel_backoff_secs")]
     pub channel_initial_backoff_secs: u64,
@@ -817,10 +972,49 @@ impl Default for ReliabilityConfig {
             provider_retries: default_provider_retries(),
             provider_backoff_ms: default_provider_backoff_ms(),
             fallback_providers: Vec::new(),
+            api_keys: Vec::new(),
+            model_fallbacks: std::collections::HashMap::new(),
             channel_initial_backoff_secs: default_channel_backoff_secs(),
             channel_max_backoff_secs: default_channel_backoff_max_secs(),
             scheduler_poll_secs: default_scheduler_poll_secs(),
             scheduler_retries: default_scheduler_retries(),
+        }
+    }
+}
+
+// ── Scheduler ────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SchedulerConfig {
+    /// Enable the built-in scheduler loop.
+    #[serde(default = "default_scheduler_enabled")]
+    pub enabled: bool,
+    /// Maximum number of persisted scheduled tasks.
+    #[serde(default = "default_scheduler_max_tasks")]
+    pub max_tasks: usize,
+    /// Maximum tasks executed per scheduler polling cycle.
+    #[serde(default = "default_scheduler_max_concurrent")]
+    pub max_concurrent: usize,
+}
+
+fn default_scheduler_enabled() -> bool {
+    true
+}
+
+fn default_scheduler_max_tasks() -> usize {
+    64
+}
+
+fn default_scheduler_max_concurrent() -> usize {
+    4
+}
+
+impl Default for SchedulerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_scheduler_enabled(),
+            max_tasks: default_scheduler_max_tasks(),
+            max_concurrent: default_scheduler_max_concurrent(),
         }
     }
 }
@@ -1276,6 +1470,7 @@ impl Default for Config {
             autonomy: AutonomyConfig::default(),
             runtime: RuntimeConfig::default(),
             reliability: ReliabilityConfig::default(),
+            scheduler: SchedulerConfig::default(),
             model_routes: Vec::new(),
             heartbeat: HeartbeatConfig::default(),
             channels_config: ChannelsConfig::default(),
@@ -1287,6 +1482,7 @@ impl Default for Config {
             browser: BrowserConfig::default(),
             http_request: HttpRequestConfig::default(),
             identity: IdentityConfig::default(),
+            cost: CostConfig::default(),
             peripherals: PeripheralsConfig::default(),
             agent: AgentConfig::default(),
             agents: HashMap::new(),
@@ -1613,6 +1809,7 @@ mod tests {
                 ..RuntimeConfig::default()
             },
             reliability: ReliabilityConfig::default(),
+            scheduler: SchedulerConfig::default(),
             model_routes: Vec::new(),
             heartbeat: HeartbeatConfig {
                 enabled: true,
@@ -1642,9 +1839,10 @@ mod tests {
             browser: BrowserConfig::default(),
             http_request: HttpRequestConfig::default(),
             identity: IdentityConfig::default(),
+            cost: CostConfig::default(),
             peripherals: PeripheralsConfig::default(),
             agent: AgentConfig::default(),
-            agents: std::collections::HashMap::new(),
+            agents: HashMap::new(),
             hardware: HardwareConfig::default(),
         };
 
@@ -1707,6 +1905,7 @@ default_temperature = 0.7
             autonomy: AutonomyConfig::default(),
             runtime: RuntimeConfig::default(),
             reliability: ReliabilityConfig::default(),
+            scheduler: SchedulerConfig::default(),
             model_routes: Vec::new(),
             heartbeat: HeartbeatConfig::default(),
             channels_config: ChannelsConfig::default(),
@@ -1718,9 +1917,10 @@ default_temperature = 0.7
             browser: BrowserConfig::default(),
             http_request: HttpRequestConfig::default(),
             identity: IdentityConfig::default(),
+            cost: CostConfig::default(),
             peripherals: PeripheralsConfig::default(),
             agent: AgentConfig::default(),
-            agents: std::collections::HashMap::new(),
+            agents: HashMap::new(),
             hardware: HardwareConfig::default(),
         };
 
