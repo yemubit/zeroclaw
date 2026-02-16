@@ -2,6 +2,7 @@ use crate::security::AutonomyLevel;
 use anyhow::{Context, Result};
 use directories::UserDirs;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -60,6 +61,9 @@ pub struct Config {
 
     #[serde(default)]
     pub browser: BrowserConfig,
+
+    #[serde(default)]
+    pub http_request: HttpRequestConfig,
 
     #[serde(default)]
     pub identity: IdentityConfig,
@@ -296,7 +300,7 @@ impl Default for SecretsConfig {
 
 // ── Browser (friendly-service browsing only) ───────────────────
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BrowserConfig {
     /// Enable `browser_open` tool (opens URLs in Brave without scraping)
     #[serde(default)]
@@ -307,6 +311,66 @@ pub struct BrowserConfig {
     /// Browser session name (for agent-browser automation)
     #[serde(default)]
     pub session_name: Option<String>,
+    /// Browser automation backend: "agent_browser" | "rust_native" | "auto"
+    #[serde(default = "default_browser_backend")]
+    pub backend: String,
+    /// Headless mode for rust-native backend
+    #[serde(default = "default_true")]
+    pub native_headless: bool,
+    /// WebDriver endpoint URL for rust-native backend (e.g. http://127.0.0.1:9515)
+    #[serde(default = "default_browser_webdriver_url")]
+    pub native_webdriver_url: String,
+    /// Optional Chrome/Chromium executable path for rust-native backend
+    #[serde(default)]
+    pub native_chrome_path: Option<String>,
+}
+
+fn default_browser_backend() -> String {
+    "agent_browser".into()
+}
+
+fn default_browser_webdriver_url() -> String {
+    "http://127.0.0.1:9515".into()
+}
+
+impl Default for BrowserConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            allowed_domains: Vec::new(),
+            session_name: None,
+            backend: default_browser_backend(),
+            native_headless: default_true(),
+            native_webdriver_url: default_browser_webdriver_url(),
+            native_chrome_path: None,
+        }
+    }
+}
+
+// ── HTTP request tool ───────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct HttpRequestConfig {
+    /// Enable `http_request` tool for API interactions
+    #[serde(default)]
+    pub enabled: bool,
+    /// Allowed domains for HTTP requests (exact or subdomain match)
+    #[serde(default)]
+    pub allowed_domains: Vec<String>,
+    /// Maximum response size in bytes (default: 1MB)
+    #[serde(default = "default_http_max_response_size")]
+    pub max_response_size: usize,
+    /// Request timeout in seconds (default: 30)
+    #[serde(default = "default_http_timeout_secs")]
+    pub timeout_secs: u64,
+}
+
+fn default_http_max_response_size() -> usize {
+    1_000_000 // 1MB
+}
+
+fn default_http_timeout_secs() -> u64 {
+    30
 }
 
 // ── Memory ───────────────────────────────────────────────────
@@ -778,6 +842,7 @@ pub struct ChannelsConfig {
     pub whatsapp: Option<WhatsAppConfig>,
     pub email: Option<crate::channels::email_channel::EmailConfig>,
     pub irc: Option<IrcConfig>,
+    pub lark: Option<LarkConfig>,
 }
 
 impl Default for ChannelsConfig {
@@ -793,6 +858,7 @@ impl Default for ChannelsConfig {
             whatsapp: None,
             email: None,
             irc: None,
+            lark: None,
         }
     }
 }
@@ -809,6 +875,10 @@ pub struct DiscordConfig {
     pub guild_id: Option<String>,
     #[serde(default)]
     pub allowed_users: Vec<String>,
+    /// When true, process messages from other bots (not just humans).
+    /// The bot still ignores its own messages to prevent feedback loops.
+    #[serde(default)]
+    pub listen_to_bots: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -847,7 +917,8 @@ pub struct WhatsAppConfig {
     pub phone_number_id: String,
     /// Webhook verify token (you define this, Meta sends it back for verification)
     pub verify_token: String,
-    /// App secret for webhook signature verification (X-Hub-Signature-256)
+    /// App secret from Meta Business Suite (for webhook signature verification)
+    /// Can also be set via `ZEROCLAW_WHATSAPP_APP_SECRET` environment variable
     #[serde(default)]
     pub app_secret: Option<String>,
     /// Allowed phone numbers (E.164 format: +1234567890) or "*" for all
@@ -886,6 +957,196 @@ fn default_irc_port() -> u16 {
     6697
 }
 
+/// Lark/Feishu configuration for messaging integration
+/// Lark is the international version, Feishu is the Chinese version
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LarkConfig {
+    /// App ID from Lark/Feishu developer console
+    pub app_id: String,
+    /// App Secret from Lark/Feishu developer console
+    pub app_secret: String,
+    /// Encrypt key for webhook message decryption (optional)
+    #[serde(default)]
+    pub encrypt_key: Option<String>,
+    /// Verification token for webhook validation (optional)
+    #[serde(default)]
+    pub verification_token: Option<String>,
+    /// Allowed user IDs or union IDs (empty = deny all, "*" = allow all)
+    #[serde(default)]
+    pub allowed_users: Vec<String>,
+    /// Whether to use the Feishu (Chinese) endpoint instead of Lark (International)
+    #[serde(default)]
+    pub use_feishu: bool,
+}
+
+// ── Security Config ─────────────────────────────────────────────────
+
+/// Security configuration for sandboxing, resource limits, and audit logging
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SecurityConfig {
+    /// Sandbox configuration
+    #[serde(default)]
+    pub sandbox: SandboxConfig,
+
+    /// Resource limits
+    #[serde(default)]
+    pub resources: ResourceLimitsConfig,
+
+    /// Audit logging configuration
+    #[serde(default)]
+    pub audit: AuditConfig,
+}
+
+impl Default for SecurityConfig {
+    fn default() -> Self {
+        Self {
+            sandbox: SandboxConfig::default(),
+            resources: ResourceLimitsConfig::default(),
+            audit: AuditConfig::default(),
+        }
+    }
+}
+
+/// Sandbox configuration for OS-level isolation
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SandboxConfig {
+    /// Enable sandboxing (None = auto-detect, Some = explicit)
+    #[serde(default)]
+    pub enabled: Option<bool>,
+
+    /// Sandbox backend to use
+    #[serde(default)]
+    pub backend: SandboxBackend,
+
+    /// Custom Firejail arguments (when backend = firejail)
+    #[serde(default)]
+    pub firejail_args: Vec<String>,
+}
+
+impl Default for SandboxConfig {
+    fn default() -> Self {
+        Self {
+            enabled: None, // Auto-detect
+            backend: SandboxBackend::Auto,
+            firejail_args: Vec::new(),
+        }
+    }
+}
+
+/// Sandbox backend selection
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SandboxBackend {
+    /// Auto-detect best available (default)
+    Auto,
+    /// Landlock (Linux kernel LSM, native)
+    Landlock,
+    /// Firejail (user-space sandbox)
+    Firejail,
+    /// Bubblewrap (user namespaces)
+    Bubblewrap,
+    /// Docker container isolation
+    Docker,
+    /// No sandboxing (application-layer only)
+    None,
+}
+
+impl Default for SandboxBackend {
+    fn default() -> Self {
+        Self::Auto
+    }
+}
+
+/// Resource limits for command execution
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResourceLimitsConfig {
+    /// Maximum memory in MB per command
+    #[serde(default = "default_max_memory_mb")]
+    pub max_memory_mb: u32,
+
+    /// Maximum CPU time in seconds per command
+    #[serde(default = "default_max_cpu_time_seconds")]
+    pub max_cpu_time_seconds: u64,
+
+    /// Maximum number of subprocesses
+    #[serde(default = "default_max_subprocesses")]
+    pub max_subprocesses: u32,
+
+    /// Enable memory monitoring
+    #[serde(default = "default_memory_monitoring_enabled")]
+    pub memory_monitoring: bool,
+}
+
+fn default_max_memory_mb() -> u32 {
+    512
+}
+
+fn default_max_cpu_time_seconds() -> u64 {
+    60
+}
+
+fn default_max_subprocesses() -> u32 {
+    10
+}
+
+fn default_memory_monitoring_enabled() -> bool {
+    true
+}
+
+impl Default for ResourceLimitsConfig {
+    fn default() -> Self {
+        Self {
+            max_memory_mb: default_max_memory_mb(),
+            max_cpu_time_seconds: default_max_cpu_time_seconds(),
+            max_subprocesses: default_max_subprocesses(),
+            memory_monitoring: default_memory_monitoring_enabled(),
+        }
+    }
+}
+
+/// Audit logging configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuditConfig {
+    /// Enable audit logging
+    #[serde(default = "default_audit_enabled")]
+    pub enabled: bool,
+
+    /// Path to audit log file (relative to zeroclaw dir)
+    #[serde(default = "default_audit_log_path")]
+    pub log_path: String,
+
+    /// Maximum log size in MB before rotation
+    #[serde(default = "default_audit_max_size_mb")]
+    pub max_size_mb: u32,
+
+    /// Sign events with HMAC for tamper evidence
+    #[serde(default)]
+    pub sign_events: bool,
+}
+
+fn default_audit_enabled() -> bool {
+    true
+}
+
+fn default_audit_log_path() -> String {
+    "audit.log".to_string()
+}
+
+fn default_audit_max_size_mb() -> u32 {
+    100
+}
+
+impl Default for AuditConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_audit_enabled(),
+            log_path: default_audit_log_path(),
+            max_size_mb: default_audit_max_size_mb(),
+            sign_events: false,
+        }
+    }
+}
+
 // ── Config impl ──────────────────────────────────────────────────
 
 impl Default for Config {
@@ -899,7 +1160,7 @@ impl Default for Config {
             config_path: zeroclaw_dir.join("config.toml"),
             api_key: None,
             default_provider: Some("openrouter".to_string()),
-            default_model: Some("anthropic/claude-sonnet-4-20250514".to_string()),
+            default_model: Some("anthropic/claude-sonnet-4".to_string()),
             default_temperature: 0.7,
             observability: ObservabilityConfig::default(),
             autonomy: AutonomyConfig::default(),
@@ -914,6 +1175,7 @@ impl Default for Config {
             composio: ComposioConfig::default(),
             secrets: SecretsConfig::default(),
             browser: BrowserConfig::default(),
+            http_request: HttpRequestConfig::default(),
             identity: IdentityConfig::default(),
             peripherals: PeripheralsConfig::default(),
             agent: AgentConfig::default(),
@@ -1014,6 +1276,11 @@ impl Config {
             }
         }
 
+        // Allow public bind: ZEROCLAW_ALLOW_PUBLIC_BIND
+        if let Ok(val) = std::env::var("ZEROCLAW_ALLOW_PUBLIC_BIND") {
+            self.gateway.allow_public_bind = val == "1" || val.eq_ignore_ascii_case("true");
+        }
+
         // Temperature: ZEROCLAW_TEMPERATURE
         if let Ok(temp_str) = std::env::var("ZEROCLAW_TEMPERATURE") {
             if let Ok(temp) = temp_str.parse::<f64>() {
@@ -1025,7 +1292,27 @@ impl Config {
     }
 
     pub fn save(&self) -> Result<()> {
-        let toml_str = toml::to_string_pretty(self).context("Failed to serialize config")?;
+        // Encrypt agent API keys before serialization
+        let mut config_to_save = self.clone();
+        let zeroclaw_dir = self
+            .config_path
+            .parent()
+            .context("Config path must have a parent directory")?;
+        let store = crate::security::SecretStore::new(zeroclaw_dir, self.secrets.encrypt);
+        for agent in config_to_save.agents.values_mut() {
+            if let Some(ref plaintext_key) = agent.api_key {
+                if !crate::security::SecretStore::is_encrypted(plaintext_key) {
+                    agent.api_key = Some(
+                        store
+                            .encrypt(plaintext_key)
+                            .context("Failed to encrypt agent API key")?,
+                    );
+                }
+            }
+        }
+
+        let toml_str =
+            toml::to_string_pretty(&config_to_save).context("Failed to serialize config")?;
 
         let parent_dir = self
             .config_path
@@ -1110,6 +1397,8 @@ fn sync_directory(_path: &Path) -> Result<()> {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+    use std::sync::{Mutex, OnceLock};
+    use tempfile::TempDir;
 
     // ── Defaults ─────────────────────────────────────────────
 
@@ -1231,6 +1520,7 @@ mod tests {
                 whatsapp: None,
                 email: None,
                 irc: None,
+                lark: None,
             },
             memory: MemoryConfig::default(),
             tunnel: TunnelConfig::default(),
@@ -1238,6 +1528,7 @@ mod tests {
             composio: ComposioConfig::default(),
             secrets: SecretsConfig::default(),
             browser: BrowserConfig::default(),
+            http_request: HttpRequestConfig::default(),
             identity: IdentityConfig::default(),
             peripherals: PeripheralsConfig::default(),
             agent: AgentConfig::default(),
@@ -1311,6 +1602,7 @@ default_temperature = 0.7
             composio: ComposioConfig::default(),
             secrets: SecretsConfig::default(),
             browser: BrowserConfig::default(),
+            http_request: HttpRequestConfig::default(),
             identity: IdentityConfig::default(),
             peripherals: PeripheralsConfig::default(),
             agent: AgentConfig::default(),
@@ -1379,6 +1671,7 @@ default_temperature = 0.7
             bot_token: "discord-token".into(),
             guild_id: Some("12345".into()),
             allowed_users: vec![],
+            listen_to_bots: false,
         };
         let json = serde_json::to_string(&dc).unwrap();
         let parsed: DiscordConfig = serde_json::from_str(&json).unwrap();
@@ -1392,6 +1685,7 @@ default_temperature = 0.7
             bot_token: "tok".into(),
             guild_id: None,
             allowed_users: vec![],
+            listen_to_bots: false,
         };
         let json = serde_json::to_string(&dc).unwrap();
         let parsed: DiscordConfig = serde_json::from_str(&json).unwrap();
@@ -1481,6 +1775,7 @@ default_temperature = 0.7
             whatsapp: None,
             email: None,
             irc: None,
+            lark: None,
         };
         let toml_str = toml::to_string_pretty(&c).unwrap();
         let parsed: ChannelsConfig = toml::from_str(&toml_str).unwrap();
@@ -1590,7 +1885,7 @@ channel_id = "C123"
             access_token: "tok".into(),
             phone_number_id: "12345".into(),
             verify_token: "verify".into(),
-            app_secret: None,
+            app_secret: Some("secret123".into()),
             allowed_numbers: vec!["+1".into()],
         };
         let toml_str = toml::to_string(&wc).unwrap();
@@ -1639,6 +1934,7 @@ channel_id = "C123"
             }),
             email: None,
             irc: None,
+            lark: None,
         };
         let toml_str = toml::to_string_pretty(&c).unwrap();
         let parsed: ChannelsConfig = toml::from_str(&toml_str).unwrap();
@@ -1858,6 +2154,10 @@ default_temperature = 0.7
         let b = BrowserConfig::default();
         assert!(!b.enabled);
         assert!(b.allowed_domains.is_empty());
+        assert_eq!(b.backend, "agent_browser");
+        assert!(b.native_headless);
+        assert_eq!(b.native_webdriver_url, "http://127.0.0.1:9515");
+        assert!(b.native_chrome_path.is_none());
     }
 
     #[test]
@@ -1866,12 +2166,23 @@ default_temperature = 0.7
             enabled: true,
             allowed_domains: vec!["example.com".into(), "docs.example.com".into()],
             session_name: None,
+            backend: "auto".into(),
+            native_headless: false,
+            native_webdriver_url: "http://localhost:4444".into(),
+            native_chrome_path: Some("/usr/bin/chromium".into()),
         };
         let toml_str = toml::to_string(&b).unwrap();
         let parsed: BrowserConfig = toml::from_str(&toml_str).unwrap();
         assert!(parsed.enabled);
         assert_eq!(parsed.allowed_domains.len(), 2);
         assert_eq!(parsed.allowed_domains[0], "example.com");
+        assert_eq!(parsed.backend, "auto");
+        assert!(!parsed.native_headless);
+        assert_eq!(parsed.native_webdriver_url, "http://localhost:4444");
+        assert_eq!(
+            parsed.native_chrome_path.as_deref(),
+            Some("/usr/bin/chromium")
+        );
     }
 
     #[test]
@@ -1886,10 +2197,19 @@ default_temperature = 0.7
         assert!(parsed.browser.allowed_domains.is_empty());
     }
 
+    fn env_override_lock() -> std::sync::MutexGuard<'static, ()> {
+        static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        ENV_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("env override test lock poisoned")
+    }
+
     // ── Environment variable overrides (Docker support) ─────────
 
     #[test]
     fn env_override_api_key() {
+        let _guard = env_override_lock();
         let mut config = Config::default();
         assert!(config.api_key.is_none());
 
@@ -1902,6 +2222,7 @@ default_temperature = 0.7
 
     #[test]
     fn env_override_api_key_fallback() {
+        let _guard = env_override_lock();
         let mut config = Config::default();
 
         std::env::remove_var("ZEROCLAW_API_KEY");
@@ -1914,6 +2235,7 @@ default_temperature = 0.7
 
     #[test]
     fn env_override_provider() {
+        let _guard = env_override_lock();
         let mut config = Config::default();
 
         std::env::set_var("ZEROCLAW_PROVIDER", "anthropic");
@@ -1925,6 +2247,7 @@ default_temperature = 0.7
 
     #[test]
     fn env_override_provider_fallback() {
+        let _guard = env_override_lock();
         let mut config = Config::default();
 
         std::env::remove_var("ZEROCLAW_PROVIDER");
@@ -1937,6 +2260,7 @@ default_temperature = 0.7
 
     #[test]
     fn env_override_model() {
+        let _guard = env_override_lock();
         let mut config = Config::default();
 
         std::env::set_var("ZEROCLAW_MODEL", "gpt-4o");
@@ -1948,6 +2272,7 @@ default_temperature = 0.7
 
     #[test]
     fn env_override_workspace() {
+        let _guard = env_override_lock();
         let mut config = Config::default();
 
         std::env::set_var("ZEROCLAW_WORKSPACE", "/custom/workspace");
@@ -1959,6 +2284,7 @@ default_temperature = 0.7
 
     #[test]
     fn env_override_empty_values_ignored() {
+        let _guard = env_override_lock();
         let mut config = Config::default();
         let original_provider = config.default_provider.clone();
 
@@ -1971,6 +2297,7 @@ default_temperature = 0.7
 
     #[test]
     fn env_override_gateway_port() {
+        let _guard = env_override_lock();
         let mut config = Config::default();
         assert_eq!(config.gateway.port, 3000);
 
@@ -1983,6 +2310,7 @@ default_temperature = 0.7
 
     #[test]
     fn env_override_port_fallback() {
+        let _guard = env_override_lock();
         let mut config = Config::default();
 
         std::env::remove_var("ZEROCLAW_GATEWAY_PORT");
@@ -1995,6 +2323,7 @@ default_temperature = 0.7
 
     #[test]
     fn env_override_gateway_host() {
+        let _guard = env_override_lock();
         let mut config = Config::default();
         assert_eq!(config.gateway.host, "127.0.0.1");
 
@@ -2007,6 +2336,7 @@ default_temperature = 0.7
 
     #[test]
     fn env_override_host_fallback() {
+        let _guard = env_override_lock();
         let mut config = Config::default();
 
         std::env::remove_var("ZEROCLAW_GATEWAY_HOST");
@@ -2019,6 +2349,7 @@ default_temperature = 0.7
 
     #[test]
     fn env_override_temperature() {
+        let _guard = env_override_lock();
         let mut config = Config::default();
 
         std::env::set_var("ZEROCLAW_TEMPERATURE", "0.5");
@@ -2030,6 +2361,7 @@ default_temperature = 0.7
 
     #[test]
     fn env_override_temperature_out_of_range_ignored() {
+        let _guard = env_override_lock();
         // Clean up any leftover env vars from other tests
         std::env::remove_var("ZEROCLAW_TEMPERATURE");
 
@@ -2049,6 +2381,7 @@ default_temperature = 0.7
 
     #[test]
     fn env_override_invalid_port_ignored() {
+        let _guard = env_override_lock();
         let mut config = Config::default();
         let original_port = config.gateway.port;
 

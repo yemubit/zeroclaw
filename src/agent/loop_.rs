@@ -1,7 +1,7 @@
 use crate::config::Config;
 use crate::memory::{self, Memory, MemoryCategory};
 use crate::observability::{self, Observer, ObserverEvent};
-use crate::providers::{self, ChatMessage, Provider};
+use crate::providers::{self, ChatMessage, Provider, ToolCall};
 use crate::runtime;
 use crate::security::SecurityPolicy;
 use crate::tools::{self, Tool};
@@ -11,13 +11,26 @@ use std::fmt::Write;
 use std::io::Write as IoWrite;
 use std::sync::Arc;
 use std::time::Instant;
+use uuid::Uuid;
 
 /// Maximum agentic tool-use iterations per user message to prevent runaway loops.
 const MAX_TOOL_ITERATIONS: usize = 10;
 
-/// Maximum number of non-system messages to keep in history.
-/// When exceeded, the oldest messages are dropped (system prompt is always preserved).
+/// Trigger auto-compaction when non-system message count exceeds this threshold.
 const MAX_HISTORY_MESSAGES: usize = 50;
+
+/// Keep this many most-recent non-system messages after compaction.
+const COMPACTION_KEEP_RECENT_MESSAGES: usize = 20;
+
+/// Safety cap for compaction source transcript passed to the summarizer.
+const COMPACTION_MAX_SOURCE_CHARS: usize = 12_000;
+
+/// Max characters retained in stored compaction summary.
+const COMPACTION_MAX_SUMMARY_CHARS: usize = 2_000;
+
+fn autosave_memory_key(prefix: &str) -> String {
+    format!("{prefix}_{}", Uuid::new_v4())
+}
 
 /// Trim conversation history to prevent unbounded growth.
 /// Preserves the system prompt (first message if role=system) and the most recent messages.
@@ -37,6 +50,79 @@ fn trim_history(history: &mut Vec<ChatMessage>) {
     let start = if has_system { 1 } else { 0 };
     let to_remove = non_system_count - MAX_HISTORY_MESSAGES;
     history.drain(start..start + to_remove);
+}
+
+fn build_compaction_transcript(messages: &[ChatMessage]) -> String {
+    let mut transcript = String::new();
+    for msg in messages {
+        let role = msg.role.to_uppercase();
+        let _ = writeln!(transcript, "{role}: {}", msg.content.trim());
+    }
+
+    if transcript.chars().count() > COMPACTION_MAX_SOURCE_CHARS {
+        truncate_with_ellipsis(&transcript, COMPACTION_MAX_SOURCE_CHARS)
+    } else {
+        transcript
+    }
+}
+
+fn apply_compaction_summary(
+    history: &mut Vec<ChatMessage>,
+    start: usize,
+    compact_end: usize,
+    summary: &str,
+) {
+    let summary_msg = ChatMessage::assistant(format!("[Compaction summary]\n{}", summary.trim()));
+    history.splice(start..compact_end, std::iter::once(summary_msg));
+}
+
+async fn auto_compact_history(
+    history: &mut Vec<ChatMessage>,
+    provider: &dyn Provider,
+    model: &str,
+) -> Result<bool> {
+    let has_system = history.first().map_or(false, |m| m.role == "system");
+    let non_system_count = if has_system {
+        history.len().saturating_sub(1)
+    } else {
+        history.len()
+    };
+
+    if non_system_count <= MAX_HISTORY_MESSAGES {
+        return Ok(false);
+    }
+
+    let start = if has_system { 1 } else { 0 };
+    let keep_recent = COMPACTION_KEEP_RECENT_MESSAGES.min(non_system_count);
+    let compact_count = non_system_count.saturating_sub(keep_recent);
+    if compact_count == 0 {
+        return Ok(false);
+    }
+
+    let compact_end = start + compact_count;
+    let to_compact: Vec<ChatMessage> = history[start..compact_end].to_vec();
+    let transcript = build_compaction_transcript(&to_compact);
+
+    let summarizer_system = "You are a conversation compaction engine. Summarize older chat history into concise context for future turns. Preserve: user preferences, commitments, decisions, unresolved tasks, key facts. Omit: filler, repeated chit-chat, verbose tool logs. Output plain text bullet points only.";
+
+    let summarizer_user = format!(
+        "Summarize the following conversation history for context preservation. Keep it short (max 12 bullet points).\n\n{}",
+        transcript
+    );
+
+    let summary_raw = provider
+        .chat_with_system(Some(summarizer_system), &summarizer_user, model, 0.2)
+        .await
+        .map(|resp| resp.text_or_empty().to_string())
+        .unwrap_or_else(|_| {
+            // Fallback to deterministic local truncation when summarization fails.
+            truncate_with_ellipsis(&transcript, COMPACTION_MAX_SUMMARY_CHARS)
+        });
+
+    let summary = truncate_with_ellipsis(&summary_raw, COMPACTION_MAX_SUMMARY_CHARS);
+    apply_compaction_summary(history, start, compact_end, &summary);
+
+    Ok(true)
 }
 
 /// Build context preamble by searching memory for relevant entries
@@ -102,6 +188,113 @@ fn find_tool<'a>(tools: &'a [Box<dyn Tool>], name: &str) -> Option<&'a dyn Tool>
     tools.iter().find(|t| t.name() == name).map(|t| t.as_ref())
 }
 
+fn parse_arguments_value(raw: Option<&serde_json::Value>) -> serde_json::Value {
+    match raw {
+        Some(serde_json::Value::String(s)) => serde_json::from_str::<serde_json::Value>(s)
+            .unwrap_or_else(|_| serde_json::Value::Object(serde_json::Map::new())),
+        Some(value) => value.clone(),
+        None => serde_json::Value::Object(serde_json::Map::new()),
+    }
+}
+
+fn parse_tool_call_value(value: &serde_json::Value) -> Option<ParsedToolCall> {
+    if let Some(function) = value.get("function") {
+        let name = function
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if !name.is_empty() {
+            let arguments = parse_arguments_value(function.get("arguments"));
+            return Some(ParsedToolCall { name, arguments });
+        }
+    }
+
+    let name = value
+        .get("name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+
+    if name.is_empty() {
+        return None;
+    }
+
+    let arguments = parse_arguments_value(value.get("arguments"));
+    Some(ParsedToolCall { name, arguments })
+}
+
+fn parse_tool_calls_from_json_value(value: &serde_json::Value) -> Vec<ParsedToolCall> {
+    let mut calls = Vec::new();
+
+    if let Some(tool_calls) = value.get("tool_calls").and_then(|v| v.as_array()) {
+        for call in tool_calls {
+            if let Some(parsed) = parse_tool_call_value(call) {
+                calls.push(parsed);
+            }
+        }
+
+        if !calls.is_empty() {
+            return calls;
+        }
+    }
+
+    if let Some(array) = value.as_array() {
+        for item in array {
+            if let Some(parsed) = parse_tool_call_value(item) {
+                calls.push(parsed);
+            }
+        }
+        return calls;
+    }
+
+    if let Some(parsed) = parse_tool_call_value(value) {
+        calls.push(parsed);
+    }
+
+    calls
+}
+
+fn extract_json_values(input: &str) -> Vec<serde_json::Value> {
+    let mut values = Vec::new();
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return values;
+    }
+
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) {
+        values.push(value);
+        return values;
+    }
+
+    let char_positions: Vec<(usize, char)> = trimmed.char_indices().collect();
+    let mut idx = 0;
+    while idx < char_positions.len() {
+        let (byte_idx, ch) = char_positions[idx];
+        if ch == '{' || ch == '[' {
+            let slice = &trimmed[byte_idx..];
+            let mut stream =
+                serde_json::Deserializer::from_str(slice).into_iter::<serde_json::Value>();
+            if let Some(Ok(value)) = stream.next() {
+                let consumed = stream.byte_offset();
+                if consumed > 0 {
+                    values.push(value);
+                    let next_byte = byte_idx + consumed;
+                    while idx < char_positions.len() && char_positions[idx].0 < next_byte {
+                        idx += 1;
+                    }
+                    continue;
+                }
+            }
+        }
+        idx += 1;
+    }
+
+    values
+}
+
 /// Parse tool calls from an LLM response that uses XML-style function calling.
 ///
 /// Expected format (common with system-prompt-guided tool use):
@@ -117,6 +310,22 @@ fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
     let mut calls = Vec::new();
     let mut remaining = response;
 
+    // First, try to parse as OpenAI-style JSON response with tool_calls array
+    // This handles providers like Minimax that return tool_calls in native JSON format
+    if let Ok(json_value) = serde_json::from_str::<serde_json::Value>(response.trim()) {
+        calls = parse_tool_calls_from_json_value(&json_value);
+        if !calls.is_empty() {
+            // If we found tool_calls, extract any content field as text
+            if let Some(content) = json_value.get("content").and_then(|v| v.as_str()) {
+                if !content.trim().is_empty() {
+                    text_parts.push(content.trim().to_string());
+                }
+            }
+            return (text_parts.join("\n"), calls);
+        }
+    }
+
+    // Fall back to XML-style <invoke> tag parsing (ZeroClaw's original format)
     while let Some(start) = remaining.find("<tool_call>") {
         // Everything before the tag is text
         let before = &remaining[..start];
@@ -126,26 +335,32 @@ fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
 
         if let Some(end) = remaining[start..].find("</tool_call>") {
             let inner = &remaining[start + 11..start + end];
-            match serde_json::from_str::<serde_json::Value>(inner.trim()) {
-                Ok(parsed) => {
-                    let name = parsed
-                        .get("name")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    let arguments = parsed
-                        .get("arguments")
-                        .cloned()
-                        .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
-                    calls.push(ParsedToolCall { name, arguments });
-                }
-                Err(e) => {
-                    tracing::warn!("Malformed <tool_call> JSON: {e}");
+            let mut parsed_any = false;
+            let json_values = extract_json_values(inner);
+            for value in json_values {
+                let parsed_calls = parse_tool_calls_from_json_value(&value);
+                if !parsed_calls.is_empty() {
+                    parsed_any = true;
+                    calls.extend(parsed_calls);
                 }
             }
+
+            if !parsed_any {
+                tracing::warn!("Malformed <tool_call> JSON: expected tool-call object in tag body");
+            }
+
             remaining = &remaining[start + end + 12..];
         } else {
             break;
+        }
+    }
+
+    if calls.is_empty() {
+        for value in extract_json_values(response) {
+            let parsed_calls = parse_tool_calls_from_json_value(&value);
+            if !parsed_calls.is_empty() {
+                calls.extend(parsed_calls);
+            }
         }
     }
 
@@ -155,6 +370,38 @@ fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
     }
 
     (text_parts.join("\n"), calls)
+}
+
+fn parse_structured_tool_calls(tool_calls: &[ToolCall]) -> Vec<ParsedToolCall> {
+    tool_calls
+        .iter()
+        .map(|call| ParsedToolCall {
+            name: call.name.clone(),
+            arguments: serde_json::from_str::<serde_json::Value>(&call.arguments)
+                .unwrap_or_else(|_| serde_json::Value::Object(serde_json::Map::new())),
+        })
+        .collect()
+}
+
+fn build_assistant_history_with_tool_calls(text: &str, tool_calls: &[ToolCall]) -> String {
+    let mut parts = Vec::new();
+
+    if !text.trim().is_empty() {
+        parts.push(text.trim().to_string());
+    }
+
+    for call in tool_calls {
+        let arguments = serde_json::from_str::<serde_json::Value>(&call.arguments)
+            .unwrap_or_else(|_| serde_json::Value::String(call.arguments.clone()));
+        let payload = serde_json::json!({
+            "id": call.id,
+            "name": call.name,
+            "arguments": arguments,
+        });
+        parts.push(format!("<tool_call>\n{payload}\n</tool_call>"));
+    }
+
+    parts.join("\n")
 }
 
 #[derive(Debug)]
@@ -171,16 +418,84 @@ async fn agent_turn(
     history: &mut Vec<ChatMessage>,
     tools_registry: &[Box<dyn Tool>],
     observer: &dyn Observer,
+    provider_name: &str,
+    model: &str,
+    temperature: f64,
+    silent: bool,
+) -> Result<String> {
+    run_tool_call_loop(
+        provider,
+        history,
+        tools_registry,
+        observer,
+        provider_name,
+        model,
+        temperature,
+    )
+    .await
+}
+
+/// Execute a single turn of the agent loop: send messages, parse tool calls,
+/// execute tools, and loop until the LLM produces a final text response.
+pub(crate) async fn run_tool_call_loop(
+    provider: &dyn Provider,
+    history: &mut Vec<ChatMessage>,
+    tools_registry: &[Box<dyn Tool>],
+    observer: &dyn Observer,
+    provider_name: &str,
     model: &str,
     temperature: f64,
     silent: bool,
 ) -> Result<String> {
     for _iteration in 0..MAX_TOOL_ITERATIONS {
-        let response = provider
-            .chat_with_history(history, model, temperature)
-            .await?;
+        observer.record_event(&ObserverEvent::LlmRequest {
+            provider: provider_name.to_string(),
+            model: model.to_string(),
+            messages_count: history.len(),
+        });
 
-        let (text, tool_calls) = parse_tool_calls(&response);
+        let llm_started_at = Instant::now();
+        let response = match provider
+            .chat_with_history(history, model, temperature)
+            .await
+        {
+            Ok(resp) => {
+                observer.record_event(&ObserverEvent::LlmResponse {
+                    provider: provider_name.to_string(),
+                    model: model.to_string(),
+                    duration: llm_started_at.elapsed(),
+                    success: true,
+                    error_message: None,
+                });
+                resp
+            }
+            Err(e) => {
+                observer.record_event(&ObserverEvent::LlmResponse {
+                    provider: provider_name.to_string(),
+                    model: model.to_string(),
+                    duration: llm_started_at.elapsed(),
+                    success: false,
+                    error_message: Some(crate::providers::sanitize_api_error(&e.to_string())),
+                });
+                return Err(e);
+            }
+        };
+
+        let response_text = response.text.unwrap_or_default();
+        let mut assistant_history_content = response_text.clone();
+        let mut parsed_text = response_text.clone();
+        let mut tool_calls = parse_structured_tool_calls(&response.tool_calls);
+
+        if !response.tool_calls.is_empty() {
+            assistant_history_content =
+                build_assistant_history_with_tool_calls(&response_text, &response.tool_calls);
+        }
+
+        if tool_calls.is_empty() {
+            let (fallback_text, fallback_calls) = parse_tool_calls(&response_text);
+            parsed_text = fallback_text;
+            tool_calls = fallback_calls;
+        }
 
         if tool_calls.is_empty() {
             // No tool calls — this is the final response
@@ -197,6 +512,9 @@ async fn agent_turn(
         // Execute each tool call and build results
         let mut tool_results = String::new();
         for call in &tool_calls {
+            observer.record_event(&ObserverEvent::ToolCallStart {
+                tool: call.name.clone(),
+            });
             let start = Instant::now();
             let result = if let Some(tool) = find_tool(tools_registry, &call.name) {
                 match tool.execute(call.arguments.clone()).await {
@@ -242,7 +560,7 @@ async fn agent_turn(
 
 /// Build the tool instruction block for the system prompt so the LLM knows
 /// how to invoke tools.
-fn build_tool_instructions(tools_registry: &[Box<dyn Tool>]) -> String {
+pub(crate) fn build_tool_instructions(tools_registry: &[Box<dyn Tool>]) -> String {
     let mut instructions = String::new();
     instructions.push_str("\n## Tool Use Protocol\n\n");
     instructions.push_str("To use a tool, wrap a JSON object in <tool_call></tool_call> tags:\n\n");
@@ -280,8 +598,15 @@ pub async fn run(
     peripheral_overrides: Vec<String>,
 ) -> Result<()> {
     // ── Wire up agnostic subsystems ──────────────────────────────
-    let observer: Arc<dyn Observer> =
-        Arc::from(observability::create_observer(&config.observability));
+    let base_observer = observability::create_observer(&config.observability);
+    let observer: Arc<dyn Observer> = if verbose {
+        Arc::from(Box::new(observability::MultiObserver::new(vec![
+            base_observer,
+            Box::new(observability::VerboseObserver::new()),
+        ])) as Box<dyn Observer>)
+    } else {
+        Arc::from(base_observer)
+    };
     let runtime: Arc<dyn runtime::RuntimeAdapter> =
         Arc::from(runtime::create_runtime(&config.runtime)?);
     let security = Arc::new(SecurityPolicy::from_config(
@@ -317,6 +642,10 @@ pub async fn run(
         mem.clone(),
         composio_key,
         &config.browser,
+        &config.http_request,
+        &config.workspace_dir,
+        &config.agents,
+        config.api_key.as_deref(),
     );
 
     let peripheral_tools: Vec<Box<dyn Tool>> =
@@ -335,7 +664,7 @@ pub async fn run(
     let model_name = model_override
         .as_deref()
         .or(config.default_model.as_deref())
-        .unwrap_or("anthropic/claude-sonnet-4-20250514");
+        .unwrap_or("anthropic/claude-sonnet-4");
 
     let provider: Box<dyn Provider> = providers::create_routed_provider(
         provider_name,
@@ -471,8 +800,9 @@ pub async fn run(
     if let Some(msg) = message {
         // Auto-save user message to memory
         if config.memory.auto_save {
+            let user_key = autosave_memory_key("user_msg");
             let _ = mem
-                .store("user_msg", &msg, MemoryCategory::Conversation)
+                .store(&user_key, &msg, MemoryCategory::Conversation)
                 .await;
         }
 
@@ -495,23 +825,26 @@ pub async fn run(
             ChatMessage::user(&enriched),
         ];
 
-        let response = agent_turn(
+        let response = run_tool_call_loop(
             provider.as_ref(),
             &mut history,
             &tools_registry,
             observer.as_ref(),
+            provider_name,
             model_name,
             temperature,
             false,
         )
         .await?;
         println!("{response}");
+        observer.record_event(&ObserverEvent::TurnComplete);
 
         // Auto-save assistant response to daily log
         if config.memory.auto_save {
             let summary = truncate_with_ellipsis(&response, 100);
+            let response_key = autosave_memory_key("assistant_resp");
             let _ = mem
-                .store("assistant_resp", &summary, MemoryCategory::Daily)
+                .store(&response_key, &summary, MemoryCategory::Daily)
                 .await;
         }
     } else {
@@ -532,8 +865,9 @@ pub async fn run(
         while let Some(msg) = rx.recv().await {
             // Auto-save conversation turns
             if config.memory.auto_save {
+                let user_key = autosave_memory_key("user_msg");
                 let _ = mem
-                    .store("user_msg", &msg.content, MemoryCategory::Conversation)
+                    .store(&user_key, &msg.content, MemoryCategory::Conversation)
                     .await;
             }
 
@@ -553,11 +887,12 @@ pub async fn run(
 
             history.push(ChatMessage::user(&enriched));
 
-            let response = match agent_turn(
+            let response = match run_tool_call_loop(
                 provider.as_ref(),
                 &mut history,
                 &tools_registry,
                 observer.as_ref(),
+                provider_name,
                 model_name,
                 temperature,
                 false,
@@ -571,14 +906,25 @@ pub async fn run(
                 }
             };
             println!("\n{response}\n");
+            observer.record_event(&ObserverEvent::TurnComplete);
 
-            // Prevent unbounded history growth in long interactive sessions
+            // Auto-compaction before hard trimming to preserve long-context signal.
+            if let Ok(compacted) =
+                auto_compact_history(&mut history, provider.as_ref(), model_name).await
+            {
+                if compacted {
+                    println!("🧹 Auto-compaction complete");
+                }
+            }
+
+            // Hard cap as a safety net.
             trim_history(&mut history);
 
             if config.memory.auto_save {
                 let summary = truncate_with_ellipsis(&response, 100);
+                let response_key = autosave_memory_key("assistant_resp");
                 let _ = mem
-                    .store("assistant_resp", &summary, MemoryCategory::Daily)
+                    .store(&response_key, &summary, MemoryCategory::Daily)
                     .await;
             }
         }
@@ -748,6 +1094,8 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::memory::{Memory, MemoryCategory, SqliteMemory};
+    use tempfile::TempDir;
 
     #[test]
     fn parse_tool_calls_extracts_single_call() {
@@ -816,6 +1164,92 @@ After text."#;
     }
 
     #[test]
+    fn parse_tool_calls_handles_openai_format() {
+        // OpenAI-style response with tool_calls array
+        let response = r#"{"content": "Let me check that for you.", "tool_calls": [{"type": "function", "function": {"name": "shell", "arguments": "{\"command\": \"ls -la\"}"}}]}"#;
+
+        let (text, calls) = parse_tool_calls(response);
+        assert_eq!(text, "Let me check that for you.");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "shell");
+        assert_eq!(
+            calls[0].arguments.get("command").unwrap().as_str().unwrap(),
+            "ls -la"
+        );
+    }
+
+    #[test]
+    fn parse_tool_calls_handles_openai_format_multiple_calls() {
+        let response = r#"{"tool_calls": [{"type": "function", "function": {"name": "file_read", "arguments": "{\"path\": \"a.txt\"}"}}, {"type": "function", "function": {"name": "file_read", "arguments": "{\"path\": \"b.txt\"}"}}]}"#;
+
+        let (_, calls) = parse_tool_calls(response);
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].name, "file_read");
+        assert_eq!(calls[1].name, "file_read");
+    }
+
+    #[test]
+    fn parse_tool_calls_openai_format_without_content() {
+        // Some providers don't include content field with tool_calls
+        let response = r#"{"tool_calls": [{"type": "function", "function": {"name": "memory_recall", "arguments": "{}"}}]}"#;
+
+        let (text, calls) = parse_tool_calls(response);
+        assert!(text.is_empty()); // No content field
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "memory_recall");
+    }
+
+    #[test]
+    fn parse_tool_calls_handles_markdown_json_inside_tool_call_tag() {
+        let response = r#"<tool_call>
+```json
+{"name": "file_write", "arguments": {"path": "test.py", "content": "print('ok')"}}
+```
+</tool_call>"#;
+
+        let (text, calls) = parse_tool_calls(response);
+        assert!(text.is_empty());
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "file_write");
+        assert_eq!(
+            calls[0].arguments.get("path").unwrap().as_str().unwrap(),
+            "test.py"
+        );
+    }
+
+    #[test]
+    fn parse_tool_calls_handles_noisy_tool_call_tag_body() {
+        let response = r#"<tool_call>
+I will now call the tool with this payload:
+{"name": "shell", "arguments": {"command": "pwd"}}
+</tool_call>"#;
+
+        let (text, calls) = parse_tool_calls(response);
+        assert!(text.is_empty());
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "shell");
+        assert_eq!(
+            calls[0].arguments.get("command").unwrap().as_str().unwrap(),
+            "pwd"
+        );
+    }
+
+    #[test]
+    fn parse_tool_calls_handles_raw_tool_json_without_tags() {
+        let response = r#"Sure, creating the file now.
+{"name": "file_write", "arguments": {"path": "hello.py", "content": "print('hello')"}}"#;
+
+        let (text, calls) = parse_tool_calls(response);
+        assert!(text.contains("Sure, creating the file now."));
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "file_write");
+        assert_eq!(
+            calls[0].arguments.get("path").unwrap().as_str().unwrap(),
+            "hello.py"
+        );
+    }
+
+    #[test]
     fn build_tool_instructions_includes_all_tools() {
         use crate::security::SecurityPolicy;
         let security = Arc::new(SecurityPolicy::from_config(
@@ -862,5 +1296,274 @@ After text."#;
         ];
         trim_history(&mut history);
         assert_eq!(history.len(), 3);
+    }
+
+    #[test]
+    fn build_compaction_transcript_formats_roles() {
+        let messages = vec![
+            ChatMessage::user("I like dark mode"),
+            ChatMessage::assistant("Got it"),
+        ];
+        let transcript = build_compaction_transcript(&messages);
+        assert!(transcript.contains("USER: I like dark mode"));
+        assert!(transcript.contains("ASSISTANT: Got it"));
+    }
+
+    #[test]
+    fn apply_compaction_summary_replaces_old_segment() {
+        let mut history = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::user("old 1"),
+            ChatMessage::assistant("old 2"),
+            ChatMessage::user("recent 1"),
+            ChatMessage::assistant("recent 2"),
+        ];
+
+        apply_compaction_summary(&mut history, 1, 3, "- user prefers concise replies");
+
+        assert_eq!(history.len(), 4);
+        assert!(history[1].content.contains("Compaction summary"));
+        assert!(history[2].content.contains("recent 1"));
+        assert!(history[3].content.contains("recent 2"));
+    }
+
+    #[test]
+    fn autosave_memory_key_has_prefix_and_uniqueness() {
+        let key1 = autosave_memory_key("user_msg");
+        let key2 = autosave_memory_key("user_msg");
+
+        assert!(key1.starts_with("user_msg_"));
+        assert!(key2.starts_with("user_msg_"));
+        assert_ne!(key1, key2);
+    }
+
+    #[tokio::test]
+    async fn autosave_memory_keys_preserve_multiple_turns() {
+        let tmp = TempDir::new().unwrap();
+        let mem = SqliteMemory::new(tmp.path()).unwrap();
+
+        let key1 = autosave_memory_key("user_msg");
+        let key2 = autosave_memory_key("user_msg");
+
+        mem.store(&key1, "I'm Paul", MemoryCategory::Conversation)
+            .await
+            .unwrap();
+        mem.store(&key2, "I'm 45", MemoryCategory::Conversation)
+            .await
+            .unwrap();
+
+        assert_eq!(mem.count().await.unwrap(), 2);
+
+        let recalled = mem.recall("45", 5).await.unwrap();
+        assert!(recalled.iter().any(|entry| entry.content.contains("45")));
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Recovery Tests - Tool Call Parsing Edge Cases
+    // ═══════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn parse_tool_calls_handles_empty_tool_result() {
+        // Recovery: Empty tool_result tag should be handled gracefully
+        let response = r#"I'll run that command.
+<tool_result name="shell">
+
+</tool_result>
+Done."#;
+        let (text, calls) = parse_tool_calls(response);
+        assert!(text.contains("Done."));
+        assert!(calls.is_empty());
+    }
+
+    #[test]
+    fn parse_arguments_value_handles_null() {
+        // Recovery: null arguments are returned as-is (Value::Null)
+        let value = serde_json::json!(null);
+        let result = parse_arguments_value(Some(&value));
+        assert!(result.is_null());
+    }
+
+    #[test]
+    fn parse_tool_calls_handles_empty_tool_calls_array() {
+        // Recovery: Empty tool_calls array returns original response (no tool parsing)
+        let response = r#"{"content": "Hello", "tool_calls": []}"#;
+        let (text, calls) = parse_tool_calls(response);
+        // When tool_calls is empty, the entire JSON is returned as text
+        assert!(text.contains("Hello"));
+        assert!(calls.is_empty());
+    }
+
+    #[test]
+    fn parse_tool_calls_handles_whitespace_only_name() {
+        // Recovery: Whitespace-only tool name should return None
+        let value = serde_json::json!({"function": {"name": "   ", "arguments": {}}});
+        let result = parse_tool_call_value(&value);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn parse_tool_calls_handles_empty_string_arguments() {
+        // Recovery: Empty string arguments should be handled
+        let value = serde_json::json!({"name": "test", "arguments": ""});
+        let result = parse_tool_call_value(&value);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().name, "test");
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Recovery Tests - History Management
+    // ═══════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn trim_history_with_no_system_prompt() {
+        // Recovery: History without system prompt should trim correctly
+        let mut history = vec![];
+        for i in 0..MAX_HISTORY_MESSAGES + 20 {
+            history.push(ChatMessage::user(format!("msg {i}")));
+        }
+        trim_history(&mut history);
+        assert_eq!(history.len(), MAX_HISTORY_MESSAGES);
+    }
+
+    #[test]
+    fn trim_history_preserves_role_ordering() {
+        // Recovery: After trimming, role ordering should remain consistent
+        let mut history = vec![ChatMessage::system("system")];
+        for i in 0..MAX_HISTORY_MESSAGES + 10 {
+            history.push(ChatMessage::user(format!("user {i}")));
+            history.push(ChatMessage::assistant(format!("assistant {i}")));
+        }
+        trim_history(&mut history);
+        assert_eq!(history[0].role, "system");
+        assert_eq!(history[history.len() - 1].role, "assistant");
+    }
+
+    #[test]
+    fn trim_history_with_only_system_prompt() {
+        // Recovery: Only system prompt should not be trimmed
+        let mut history = vec![ChatMessage::system("system prompt")];
+        trim_history(&mut history);
+        assert_eq!(history.len(), 1);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Recovery Tests - Arguments Parsing
+    // ═══════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn parse_arguments_value_handles_invalid_json_string() {
+        // Recovery: Invalid JSON string should return empty object
+        let value = serde_json::Value::String("not valid json".to_string());
+        let result = parse_arguments_value(Some(&value));
+        assert!(result.is_object());
+        assert!(result.as_object().unwrap().is_empty());
+    }
+
+    #[test]
+    fn parse_arguments_value_handles_none() {
+        // Recovery: None arguments should return empty object
+        let result = parse_arguments_value(None);
+        assert!(result.is_object());
+        assert!(result.as_object().unwrap().is_empty());
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Recovery Tests - JSON Extraction
+    // ═══════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn extract_json_values_handles_empty_string() {
+        // Recovery: Empty input should return empty vec
+        let result = extract_json_values("");
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn extract_json_values_handles_whitespace_only() {
+        // Recovery: Whitespace only should return empty vec
+        let result = extract_json_values("   \n\t  ");
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn extract_json_values_handles_multiple_objects() {
+        // Recovery: Multiple JSON objects should all be extracted
+        let input = r#"{"a": 1}{"b": 2}{"c": 3}"#;
+        let result = extract_json_values(input);
+        assert_eq!(result.len(), 3);
+    }
+
+    #[test]
+    fn extract_json_values_handles_arrays() {
+        // Recovery: JSON arrays should be extracted
+        let input = r#"[1, 2, 3]{"key": "value"}"#;
+        let result = extract_json_values(input);
+        assert_eq!(result.len(), 2);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Recovery Tests - Constants Validation
+    // ═══════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn max_tool_iterations_is_reasonable() {
+        // Recovery: MAX_TOOL_ITERATIONS should be set to prevent runaway loops
+        assert!(MAX_TOOL_ITERATIONS > 0);
+        assert!(MAX_TOOL_ITERATIONS <= 100);
+    }
+
+    #[test]
+    fn max_history_messages_is_reasonable() {
+        // Recovery: MAX_HISTORY_MESSAGES should be set to prevent memory bloat
+        assert!(MAX_HISTORY_MESSAGES > 0);
+        assert!(MAX_HISTORY_MESSAGES <= 1000);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Recovery Tests - Tool Call Value Parsing
+    // ═══════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn parse_tool_call_value_handles_missing_name_field() {
+        // Recovery: Missing name field should return None
+        let value = serde_json::json!({"function": {"arguments": {}}});
+        let result = parse_tool_call_value(&value);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn parse_tool_call_value_handles_top_level_name() {
+        // Recovery: Tool call with name at top level (non-OpenAI format)
+        let value = serde_json::json!({"name": "test_tool", "arguments": {}});
+        let result = parse_tool_call_value(&value);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().name, "test_tool");
+    }
+
+    #[test]
+    fn parse_tool_calls_from_json_value_handles_empty_array() {
+        // Recovery: Empty tool_calls array should return empty vec
+        let value = serde_json::json!({"tool_calls": []});
+        let result = parse_tool_calls_from_json_value(&value);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn parse_tool_calls_from_json_value_handles_missing_tool_calls() {
+        // Recovery: Missing tool_calls field should fall through
+        let value = serde_json::json!({"name": "test", "arguments": {}});
+        let result = parse_tool_calls_from_json_value(&value);
+        assert_eq!(result.len(), 1);
+    }
+
+    #[test]
+    fn parse_tool_calls_from_json_value_handles_top_level_array() {
+        // Recovery: Top-level array of tool calls
+        let value = serde_json::json!([
+            {"name": "tool_a", "arguments": {}},
+            {"name": "tool_b", "arguments": {}}
+        ]);
+        let result = parse_tool_calls_from_json_value(&value);
+        assert_eq!(result.len(), 2);
     }
 }

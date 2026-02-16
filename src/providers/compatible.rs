@@ -2,7 +2,7 @@
 //! Most LLM APIs follow the same `/v1/chat/completions` format.
 //! This module provides a single implementation that works for all of them.
 
-use crate::providers::traits::{ChatMessage, Provider};
+use crate::providers::traits::{ChatMessage, ChatResponse, Provider, ToolCall};
 use async_trait::async_trait;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -74,21 +74,61 @@ impl OpenAiCompatibleProvider {
     /// This allows custom providers with non-standard endpoints (e.g., VolcEngine ARK uses
     /// `/api/coding/v3/chat/completions` instead of `/v1/chat/completions`).
     fn chat_completions_url(&self) -> String {
-        // If base_url already contains "chat/completions", use it as-is
-        if self.base_url.contains("chat/completions") {
+        let has_full_endpoint = reqwest::Url::parse(&self.base_url)
+            .map(|url| {
+                url.path()
+                    .trim_end_matches('/')
+                    .ends_with("/chat/completions")
+            })
+            .unwrap_or_else(|_| {
+                self.base_url
+                    .trim_end_matches('/')
+                    .ends_with("/chat/completions")
+            });
+
+        if has_full_endpoint {
             self.base_url.clone()
         } else {
             format!("{}/chat/completions", self.base_url)
         }
     }
 
+    fn path_ends_with(&self, suffix: &str) -> bool {
+        if let Ok(url) = reqwest::Url::parse(&self.base_url) {
+            return url.path().trim_end_matches('/').ends_with(suffix);
+        }
+
+        self.base_url.trim_end_matches('/').ends_with(suffix)
+    }
+
+    fn has_explicit_api_path(&self) -> bool {
+        let Ok(url) = reqwest::Url::parse(&self.base_url) else {
+            return false;
+        };
+
+        let path = url.path().trim_end_matches('/');
+        !path.is_empty() && path != "/"
+    }
+
     /// Build the full URL for responses API, detecting if base_url already includes the path.
     fn responses_url(&self) -> String {
-        // If base_url already contains "responses", use it as-is
-        if self.base_url.contains("responses") {
-            self.base_url.clone()
+        if self.path_ends_with("/responses") {
+            return self.base_url.clone();
+        }
+
+        let normalized_base = self.base_url.trim_end_matches('/');
+
+        // If chat endpoint is explicitly configured, derive sibling responses endpoint.
+        if let Some(prefix) = normalized_base.strip_suffix("/chat/completions") {
+            return format!("{prefix}/responses");
+        }
+
+        // If an explicit API path already exists (e.g. /v1, /openai, /api/coding/v3),
+        // append responses directly to avoid duplicate /v1 segments.
+        if self.has_explicit_api_path() {
+            format!("{normalized_base}/responses")
         } else {
-            format!("{}/v1/responses", self.base_url)
+            format!("{normalized_base}/v1/responses")
         }
     }
 }
@@ -118,9 +158,26 @@ struct Choice {
     message: ResponseMessage,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 struct ResponseMessage {
-    content: String,
+    #[serde(default)]
+    content: Option<String>,
+    #[serde(default)]
+    tool_calls: Option<Vec<ApiToolCall>>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct ApiToolCall {
+    id: Option<String>,
+    #[serde(rename = "type")]
+    kind: Option<String>,
+    function: Option<Function>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct Function {
+    name: Option<String>,
+    arguments: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -197,6 +254,44 @@ fn extract_responses_text(response: ResponsesResponse) -> Option<String> {
     None
 }
 
+fn map_response_message(message: ResponseMessage) -> ChatResponse {
+    let text = first_nonempty(message.content.as_deref());
+    let tool_calls = message
+        .tool_calls
+        .unwrap_or_default()
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, call)| map_api_tool_call(call, index))
+        .collect();
+
+    ChatResponse { text, tool_calls }
+}
+
+fn map_api_tool_call(call: ApiToolCall, index: usize) -> Option<ToolCall> {
+    if call.kind.as_deref().is_some_and(|kind| kind != "function") {
+        return None;
+    }
+
+    let function = call.function?;
+    let name = function
+        .name
+        .and_then(|value| first_nonempty(Some(value.as_str())))?;
+    let arguments = function
+        .arguments
+        .and_then(|value| first_nonempty(Some(value.as_str())))
+        .unwrap_or_else(|| "{}".to_string());
+    let id = call
+        .id
+        .and_then(|value| first_nonempty(Some(value.as_str())))
+        .unwrap_or_else(|| format!("call_{}", index + 1));
+
+    Some(ToolCall {
+        id,
+        name,
+        arguments,
+    })
+}
+
 impl OpenAiCompatibleProvider {
     fn apply_auth_header(
         &self,
@@ -216,7 +311,7 @@ impl OpenAiCompatibleProvider {
         system_prompt: Option<&str>,
         message: &str,
         model: &str,
-    ) -> anyhow::Result<String> {
+    ) -> anyhow::Result<ChatResponse> {
         let request = ResponsesRequest {
             model: model.to_string(),
             input: vec![ResponsesInput {
@@ -242,6 +337,7 @@ impl OpenAiCompatibleProvider {
         let responses: ResponsesResponse = response.json().await?;
 
         extract_responses_text(responses)
+            .map(ChatResponse::with_text)
             .ok_or_else(|| anyhow::anyhow!("No response from {} Responses API", self.name))
     }
 }
@@ -254,7 +350,7 @@ impl Provider for OpenAiCompatibleProvider {
         message: &str,
         model: &str,
         temperature: f64,
-    ) -> anyhow::Result<String> {
+    ) -> anyhow::Result<ChatResponse> {
         let api_key = self.api_key.as_ref().ok_or_else(|| {
             anyhow::anyhow!(
                 "{} API key not set. Run `zeroclaw onboard` or set the appropriate env var.",
@@ -312,12 +408,13 @@ impl Provider for OpenAiCompatibleProvider {
 
         let chat_response: ApiChatResponse = response.json().await?;
 
-        chat_response
+        let choice = chat_response
             .choices
             .into_iter()
             .next()
-            .map(|c| c.message.content)
-            .ok_or_else(|| anyhow::anyhow!("No response from {}", self.name))
+            .ok_or_else(|| anyhow::anyhow!("No response from {}", self.name))?;
+
+        Ok(map_response_message(choice.message))
     }
 
     async fn chat_with_history(
@@ -325,7 +422,7 @@ impl Provider for OpenAiCompatibleProvider {
         messages: &[ChatMessage],
         model: &str,
         temperature: f64,
-    ) -> anyhow::Result<String> {
+    ) -> anyhow::Result<ChatResponse> {
         let api_key = self.api_key.as_ref().ok_or_else(|| {
             anyhow::anyhow!(
                 "{} API key not set. Run `zeroclaw onboard` or set the appropriate env var.",
@@ -385,12 +482,13 @@ impl Provider for OpenAiCompatibleProvider {
 
         let chat_response: ApiChatResponse = response.json().await?;
 
-        chat_response
+        let choice = chat_response
             .choices
             .into_iter()
             .next()
-            .map(|c| c.message.content)
-            .ok_or_else(|| anyhow::anyhow!("No response from {}", self.name))
+            .ok_or_else(|| anyhow::anyhow!("No response from {}", self.name))?;
+
+        Ok(map_response_message(choice.message))
     }
 }
 
@@ -462,7 +560,10 @@ mod tests {
     fn response_deserializes() {
         let json = r#"{"choices":[{"message":{"content":"Hello from Venice!"}}]}"#;
         let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
-        assert_eq!(resp.choices[0].message.content, "Hello from Venice!");
+        assert_eq!(
+            resp.choices[0].message.content,
+            Some("Hello from Venice!".to_string())
+        );
     }
 
     #[test]
@@ -470,6 +571,20 @@ mod tests {
         let json = r#"{"choices":[]}"#;
         let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
         assert!(resp.choices.is_empty());
+    }
+
+    #[test]
+    fn response_with_tool_calls_maps_structured_data() {
+        let json = r#"{"choices":[{"message":{"content":"Running checks","tool_calls":[{"id":"call_1","type":"function","function":{"name":"shell","arguments":"{\"command\":\"pwd\"}"}}]}}]}"#;
+        let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
+        let choice = resp.choices.into_iter().next().unwrap();
+
+        let mapped = map_response_message(choice.message);
+        assert_eq!(mapped.text.as_deref(), Some("Running checks"));
+        assert_eq!(mapped.tool_calls.len(), 1);
+        assert_eq!(mapped.tool_calls[0].id, "call_1");
+        assert_eq!(mapped.tool_calls[0].name, "shell");
+        assert_eq!(mapped.tool_calls[0].arguments, r#"{"command":"pwd"}"#);
     }
 
     #[test]
@@ -601,6 +716,19 @@ mod tests {
     }
 
     #[test]
+    fn chat_completions_url_requires_exact_suffix_match() {
+        let p = make_provider(
+            "custom",
+            "https://my-api.example.com/v2/llm/chat/completions-proxy",
+            None,
+        );
+        assert_eq!(
+            p.chat_completions_url(),
+            "https://my-api.example.com/v2/llm/chat/completions-proxy/chat/completions"
+        );
+    }
+
+    #[test]
     fn responses_url_standard() {
         // Standard providers get /v1/responses appended
         let p = make_provider("test", "https://api.example.com", None);
@@ -618,6 +746,47 @@ mod tests {
         assert_eq!(
             p.responses_url(),
             "https://my-api.example.com/api/v2/responses"
+        );
+    }
+
+    #[test]
+    fn responses_url_requires_exact_suffix_match() {
+        let p = make_provider(
+            "custom",
+            "https://my-api.example.com/api/v2/responses-proxy",
+            None,
+        );
+        assert_eq!(
+            p.responses_url(),
+            "https://my-api.example.com/api/v2/responses-proxy/responses"
+        );
+    }
+
+    #[test]
+    fn responses_url_derives_from_chat_endpoint() {
+        let p = make_provider(
+            "custom",
+            "https://my-api.example.com/api/v2/chat/completions",
+            None,
+        );
+        assert_eq!(
+            p.responses_url(),
+            "https://my-api.example.com/api/v2/responses"
+        );
+    }
+
+    #[test]
+    fn responses_url_base_with_v1_no_duplicate() {
+        let p = make_provider("test", "https://api.example.com/v1", None);
+        assert_eq!(p.responses_url(), "https://api.example.com/v1/responses");
+    }
+
+    #[test]
+    fn responses_url_non_v1_api_path_uses_raw_suffix() {
+        let p = make_provider("test", "https://api.example.com/api/coding/v3", None);
+        assert_eq!(
+            p.responses_url(),
+            "https://api.example.com/api/coding/v3/responses"
         );
     }
 

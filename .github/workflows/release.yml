@@ -14,7 +14,9 @@ jobs:
   build-release:
     name: Build ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
     strategy:
+      fail-fast: false
       matrix:
         include:
           - os: ubuntu-latest
@@ -40,7 +42,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Build release
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --release --locked --target ${{ matrix.target }}
 
       - name: Check binary size (Unix)
         if: runner.os != 'Windows'
@@ -64,7 +66,7 @@ jobs:
           7z a ../../../zeroclaw-${{ matrix.target }}.zip ${{ matrix.artifact }}
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: zeroclaw-${{ matrix.target }}
           path: zeroclaw-${{ matrix.target }}.*
@@ -73,6 +75,7 @@ jobs:
     name: Publish Release
     needs: build-release
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
 

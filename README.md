@@ -11,6 +11,7 @@
 
 <p align="center">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License: MIT" /></a>
+  <a href="https://buymeacoffee.com/argenistherose"><img src="https://img.shields.io/badge/Buy%20Me%20a%20Coffee-Donate-yellow.svg?style=flat&logo=buy-me-a-coffee" alt="Buy Me a Coffee" /></a>
 </p>
 
 Fast, small, and fully autonomous AI assistant infrastructure — deploy anywhere, swap anything.
@@ -64,7 +65,7 @@ ls -lh target/release/zeroclaw
 ## Quick Start
 
 ```bash
-git clone https://github.com/theonlyhennygod/zeroclaw.git
+git clone https://github.com/zeroclaw-labs/zeroclaw.git
 cd zeroclaw
 cargo build --release
 cargo install --path . --force
@@ -127,9 +128,9 @@ Every subsystem is a **trait** — swap implementations with a config change, ze
 | **AI Models** | `Provider` | 22+ providers (OpenRouter, Anthropic, OpenAI, Ollama, Venice, Groq, Mistral, xAI, DeepSeek, Together, Fireworks, Perplexity, Cohere, Bedrock, etc.) | `custom:https://your-api.com` — any OpenAI-compatible API |
 | **Channels** | `Channel` | CLI, Telegram, Discord, Slack, iMessage, Matrix, WhatsApp, Webhook | Any messaging API |
 | **Memory** | `Memory` | SQLite with hybrid search (FTS5 + vector cosine similarity), Markdown | Any persistence backend |
-| **Tools** | `Tool` | shell, file_read, file_write, memory_store, memory_recall, memory_forget, browser_open (Brave + allowlist), composio (optional) | Any capability |
+| **Tools** | `Tool` | shell, file_read, file_write, memory_store, memory_recall, memory_forget, browser_open (Brave + allowlist), browser (agent-browser / rust-native), composio (optional) | Any capability |
 | **Observability** | `Observer` | Noop, Log, Multi | Prometheus, OTel |
-| **Runtime** | `RuntimeAdapter` | Native (Mac/Linux/Pi) | Docker, WASM (planned; unsupported kinds fail fast) |
+| **Runtime** | `RuntimeAdapter` | Native, Docker (sandboxed) | WASM (planned; unsupported kinds fail fast) |
 | **Security** | `SecurityPolicy` | Gateway pairing, sandbox, allowlists, rate limits, filesystem scoping, encrypted secrets | — |
 | **Identity** | `IdentityConfig` | OpenClaw (markdown), AIEOS v1.1 (JSON) | Any identity format |
 | **Tunnel** | `Tunnel` | None, Cloudflare, Tailscale, ngrok, Custom | Any tunnel binary |
@@ -139,8 +140,8 @@ Every subsystem is a **trait** — swap implementations with a config change, ze
 
 ### Runtime support (current)
 
-- ✅ Supported today: `runtime.kind = "native"`
-- 🚧 Planned, not implemented yet: Docker / WASM / edge runtimes
+- ✅ Supported today: `runtime.kind = "native"` or `runtime.kind = "docker"`
+- 🚧 Planned, not implemented yet: WASM / edge runtimes
 
 When an unsupported `runtime.kind` is configured, ZeroClaw now exits with a clear error instead of silently falling back to native.
 
@@ -279,7 +280,16 @@ allowed_commands = ["git", "npm", "cargo", "ls", "cat", "grep"]
 forbidden_paths = ["/etc", "/root", "/proc", "/sys", "~/.ssh", "~/.gnupg", "~/.aws"]
 
 [runtime]
-kind = "native"                # only supported value right now; unsupported kinds fail fast
+kind = "native"                # "native" or "docker"
+
+[runtime.docker]
+image = "alpine:3.20"          # container image for shell execution
+network = "none"               # docker network mode ("none", "bridge", etc.)
+memory_limit_mb = 512          # optional memory limit in MB
+cpu_limit = 1.0                # optional CPU limit
+read_only_rootfs = true        # mount root filesystem as read-only
+mount_workspace = true         # mount workspace into /workspace
+allowed_workspace_roots = []   # optional allowlist for workspace mount validation
 
 [heartbeat]
 enabled = false
@@ -292,8 +302,16 @@ provider = "none"               # "none", "cloudflare", "tailscale", "ngrok", "c
 encrypt = true                  # API keys encrypted with local key file
 
 [browser]
-enabled = false                 # opt-in browser_open tool
-allowed_domains = ["docs.rs"]  # required when browser is enabled
+enabled = false                        # opt-in browser_open + browser tools
+allowed_domains = ["docs.rs"]         # required when browser is enabled
+backend = "agent_browser"             # "agent_browser" (default), "rust_native", "auto"
+native_headless = true                 # applies when backend uses rust-native
+native_webdriver_url = "http://127.0.0.1:9515" # WebDriver endpoint (chromedriver/selenium)
+# native_chrome_path = "/usr/bin/chromium"  # optional explicit browser binary for driver
+
+# Rust-native backend build flag:
+# cargo build --release --features browser-native
+# Ensure a WebDriver server is running, e.g. chromedriver --port=9515
 
 [composio]
 enabled = false                 # opt-in: 1000+ OAuth apps via composio.dev
@@ -427,6 +445,22 @@ To skip the hook when you need a quick push during development:
 git push --no-verify
 ```
 
+## Collaboration & Docs
+
+For high-throughput collaboration and consistent reviews:
+
+- Contribution guide: [CONTRIBUTING.md](CONTRIBUTING.md)
+- PR workflow policy: [docs/pr-workflow.md](docs/pr-workflow.md)
+- Reviewer playbook (triage + deep review): [docs/reviewer-playbook.md](docs/reviewer-playbook.md)
+- CI ownership and triage map: [docs/ci-map.md](docs/ci-map.md)
+- Security disclosure policy: [SECURITY.md](SECURITY.md)
+
+## Support
+
+ZeroClaw is an open-source project maintained with passion. If you find it useful and would like to support its continued development, hardware for testing, and coffee for the maintainer, you can support me here:
+
+<a href="https://buymeacoffee.com/argenistherose"><img src="https://img.shields.io/badge/Buy%20Me%20a%20Coffee-Donate-yellow.svg?style=for-the-badge&logo=buy-me-a-coffee" alt="Buy Me a Coffee" /></a>
+
 ## License
 
 MIT — see [LICENSE](LICENSE)
@@ -434,6 +468,7 @@ MIT — see [LICENSE](LICENSE)
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md). Implement a trait, submit a PR:
+- CI workflow guide: [docs/ci-map.md](docs/ci-map.md)
 - New `Provider` → `src/providers/`
 - New `Channel` → `src/channels/`
 - New `Observer` → `src/observability/`
@@ -445,3 +480,11 @@ See [CONTRIBUTING.md](CONTRIBUTING.md). Implement a trait, submit a PR:
 ---
 
 **ZeroClaw** — Zero overhead. Zero compromise. Deploy anywhere. Swap anything. 🦀
+
+## Star History
+
+<p align="center">
+  <a href="https://www.star-history.com/#zeroclaw-labs/zeroclaw&Date">
+    <img src="https://api.star-history.com/svg?repos=zeroclaw-labs/zeroclaw&type=Date" alt="Star History Chart" />
+  </a>
+</p>

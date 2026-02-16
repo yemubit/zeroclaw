@@ -20,12 +20,19 @@ pub use telegram::TelegramChannel;
 pub use traits::Channel;
 pub use whatsapp::WhatsAppChannel;
 
+use crate::agent::loop_::{agent_turn, build_tool_instructions};
 use crate::config::Config;
 use crate::identity;
 use crate::memory::{self, Memory};
-use crate::providers::{self, Provider};
+use crate::observability::{self, Observer};
+use crate::providers::{self, ChatMessage, Provider};
+use crate::runtime;
+use crate::security::SecurityPolicy;
+use crate::tools::{self, Tool};
 use crate::util::truncate_with_ellipsis;
 use anyhow::Result;
+use std::collections::HashMap;
+use std::fmt::Write;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -76,6 +83,159 @@ fn spawn_supervised_listener(
             backoff = backoff.saturating_mul(2).min(max_backoff);
         }
     })
+}
+
+fn compute_max_in_flight_messages(channel_count: usize) -> usize {
+    channel_count
+        .saturating_mul(CHANNEL_PARALLELISM_PER_CHANNEL)
+        .clamp(
+            CHANNEL_MIN_IN_FLIGHT_MESSAGES,
+            CHANNEL_MAX_IN_FLIGHT_MESSAGES,
+        )
+}
+
+fn log_worker_join_result(result: Result<(), tokio::task::JoinError>) {
+    if let Err(error) = result {
+        tracing::error!("Channel message worker crashed: {error}");
+    }
+}
+
+async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::ChannelMessage) {
+    println!(
+        "  💬 [{}] from {}: {}",
+        msg.channel,
+        msg.sender,
+        truncate_with_ellipsis(&msg.content, 80)
+    );
+
+    let memory_context = build_memory_context(ctx.memory.as_ref(), &msg.content).await;
+
+    if ctx.auto_save_memory {
+        let autosave_key = conversation_memory_key(&msg);
+        let _ = ctx
+            .memory
+            .store(
+                &autosave_key,
+                &msg.content,
+                crate::memory::MemoryCategory::Conversation,
+            )
+            .await;
+    }
+
+    let enriched_message = if memory_context.is_empty() {
+        msg.content.clone()
+    } else {
+        format!("{memory_context}{}", msg.content)
+    };
+
+    let target_channel = ctx.channels_by_name.get(&msg.channel).cloned();
+
+    if let Some(channel) = target_channel.as_ref() {
+        if let Err(e) = channel.start_typing(&msg.sender).await {
+            tracing::debug!("Failed to start typing on {}: {e}", channel.name());
+        }
+    }
+
+    println!("  ⏳ Processing message...");
+    let started_at = Instant::now();
+
+    let mut history = vec![
+        ChatMessage::system(ctx.system_prompt.as_str()),
+        ChatMessage::user(&enriched_message),
+    ];
+
+    let llm_result = tokio::time::timeout(
+        Duration::from_secs(CHANNEL_MESSAGE_TIMEOUT_SECS),
+        agent_turn(
+            ctx.provider.as_ref(),
+            &mut history,
+            ctx.tools_registry.as_ref(),
+            ctx.observer.as_ref(),
+            ctx.provider_name.as_str(),
+            ctx.model.as_str(),
+            ctx.temperature,
+        ),
+    )
+    .await;
+
+    if let Some(channel) = target_channel.as_ref() {
+        if let Err(e) = channel.stop_typing(&msg.sender).await {
+            tracing::debug!("Failed to stop typing on {}: {e}", channel.name());
+        }
+    }
+
+    match llm_result {
+        Ok(Ok(response)) => {
+            println!(
+                "  🤖 Reply ({}ms): {}",
+                started_at.elapsed().as_millis(),
+                truncate_with_ellipsis(&response, 80)
+            );
+            if let Some(channel) = target_channel.as_ref() {
+                if let Err(e) = channel.send(&response, &msg.sender).await {
+                    eprintln!("  ❌ Failed to reply on {}: {e}", channel.name());
+                }
+            }
+        }
+        Ok(Err(e)) => {
+            eprintln!(
+                "  ❌ LLM error after {}ms: {e}",
+                started_at.elapsed().as_millis()
+            );
+            if let Some(channel) = target_channel.as_ref() {
+                let _ = channel.send(&format!("⚠️ Error: {e}"), &msg.sender).await;
+            }
+        }
+        Err(_) => {
+            let timeout_msg = format!(
+                "LLM response timed out after {}s",
+                CHANNEL_MESSAGE_TIMEOUT_SECS
+            );
+            eprintln!(
+                "  ❌ {} (elapsed: {}ms)",
+                timeout_msg,
+                started_at.elapsed().as_millis()
+            );
+            if let Some(channel) = target_channel.as_ref() {
+                let _ = channel
+                    .send(
+                        "⚠️ Request timed out while waiting for the model. Please try again.",
+                        &msg.sender,
+                    )
+                    .await;
+            }
+        }
+    }
+}
+
+async fn run_message_dispatch_loop(
+    mut rx: tokio::sync::mpsc::Receiver<traits::ChannelMessage>,
+    ctx: Arc<ChannelRuntimeContext>,
+    max_in_flight_messages: usize,
+) {
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(max_in_flight_messages));
+    let mut workers = tokio::task::JoinSet::new();
+
+    while let Some(msg) = rx.recv().await {
+        let permit = match Arc::clone(&semaphore).acquire_owned().await {
+            Ok(permit) => permit,
+            Err(_) => break,
+        };
+
+        let worker_ctx = Arc::clone(&ctx);
+        workers.spawn(async move {
+            let _permit = permit;
+            process_channel_message(worker_ctx, msg).await;
+        });
+
+        while let Some(result) = workers.try_join_next() {
+            log_worker_join_result(result);
+        }
+    }
+
+    while let Some(result) = workers.join_next().await {
+        log_worker_join_result(result);
+    }
 }
 
 /// Load OpenClaw format bootstrap files into the prompt.
@@ -145,7 +305,13 @@ pub fn build_system_prompt(
         for (name, desc) in tools {
             let _ = writeln!(prompt, "- **{name}**: {desc}");
         }
-        prompt.push('\n');
+        prompt.push_str("\n## Tool Use Protocol\n\n");
+        prompt.push_str("To use a tool, wrap a JSON object in <tool_call></tool_call> tags:\n\n");
+        prompt.push_str("```\n<tool_call>\n{\"name\": \"tool_name\", \"arguments\": {\"param\": \"value\"}}\n</tool_call>\n```\n\n");
+        prompt.push_str("You may use multiple tool calls in a single response. ");
+        prompt.push_str("After tool execution, results appear in <tool_result> tags. ");
+        prompt
+            .push_str("Continue reasoning with the results until you can give a final answer.\n\n");
     }
 
     // ── 1b. Hardware (when gpio/arduino tools present) ───────────
@@ -409,6 +575,7 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
                 dc.bot_token.clone(),
                 dc.guild_id.clone(),
                 dc.allowed_users.clone(),
+                dc.listen_to_bots,
             )),
         ));
     }
@@ -521,8 +688,12 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
 /// Start all configured channels and route messages to the agent
 #[allow(clippy::too_many_lines)]
 pub async fn start_channels(config: Config) -> Result<()> {
+    let provider_name = config
+        .default_provider
+        .clone()
+        .unwrap_or_else(|| "openrouter".to_string());
     let provider: Arc<dyn Provider> = Arc::from(providers::create_resilient_provider(
-        config.default_provider.as_deref().unwrap_or("openrouter"),
+        provider_name.as_str(),
         config.api_key.as_deref(),
         &config.reliability,
     )?);
@@ -533,16 +704,42 @@ pub async fn start_channels(config: Config) -> Result<()> {
         tracing::warn!("Provider warmup failed (non-fatal): {e}");
     }
 
+    let observer: Arc<dyn Observer> =
+        Arc::from(observability::create_observer(&config.observability));
+    let runtime: Arc<dyn runtime::RuntimeAdapter> =
+        Arc::from(runtime::create_runtime(&config.runtime)?);
+    let security = Arc::new(SecurityPolicy::from_config(
+        &config.autonomy,
+        &config.workspace_dir,
+    ));
+
     let model = config
         .default_model
         .clone()
-        .unwrap_or_else(|| "anthropic/claude-sonnet-4-20250514".into());
+        .unwrap_or_else(|| "anthropic/claude-sonnet-4".into());
     let temperature = config.default_temperature;
     let mem: Arc<dyn Memory> = Arc::from(memory::create_memory(
         &config.memory,
         &config.workspace_dir,
         config.api_key.as_deref(),
     )?);
+
+    let composio_key = if config.composio.enabled {
+        config.composio.api_key.as_deref()
+    } else {
+        None
+    };
+    let tools_registry = Arc::new(tools::all_tools_with_runtime(
+        &security,
+        runtime,
+        Arc::clone(&mem),
+        composio_key,
+        &config.browser,
+        &config.http_request,
+        &config.workspace_dir,
+        &config.agents,
+        config.api_key.as_deref(),
+    ));
 
     // Build system prompt from workspace identity files + skills
     let workspace = config.workspace_dir.clone();
@@ -582,6 +779,18 @@ pub async fn start_channels(config: Config) -> Result<()> {
             "Open approved HTTPS URLs in Brave Browser (allowlist-only, no scraping)",
         ));
     }
+    if config.composio.enabled {
+        tool_descs.push((
+            "composio",
+            "Execute actions on 1000+ apps via Composio (Gmail, Notion, GitHub, Slack, etc.). Use action='list' to discover, 'execute' to run, 'connect' to OAuth.",
+        ));
+    }
+    if !config.agents.is_empty() {
+        tool_descs.push((
+            "delegate",
+            "Delegate a subtask to a specialized agent. Use when: a task benefits from a different model (e.g. fast summarization, deep reasoning, code generation). The sub-agent runs a single prompt and returns its response.",
+        ));
+    }
 
     let bootstrap_max_chars = if config.agent.compact_context {
         Some(6000)
@@ -596,6 +805,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
         Some(&config.identity),
         bootstrap_max_chars,
     );
+    system_prompt.push_str(&build_tool_instructions(tools_registry.as_ref()));
 
     if !skills.is_empty() {
         println!(
@@ -623,6 +833,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
             dc.bot_token.clone(),
             dc.guild_id.clone(),
             dc.allowed_users.clone(),
+            dc.listen_to_bots,
         )));
     }
 
@@ -711,7 +922,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
         .max(DEFAULT_CHANNEL_MAX_BACKOFF_SECS);
 
     // Single message bus — all channels send messages here
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(100);
+    let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(100);
 
     // Spawn a listener for each channel
     let mut handles = Vec::new();
@@ -725,25 +936,15 @@ pub async fn start_channels(config: Config) -> Result<()> {
     }
     drop(tx); // Drop our copy so rx closes when all channels stop
 
-    // Process incoming messages — call the LLM and reply
-    while let Some(msg) = rx.recv().await {
-        println!(
-            "  💬 [{}] from {}: {}",
-            msg.channel,
-            msg.sender,
-            truncate_with_ellipsis(&msg.content, 80)
-        );
+    let channels_by_name = Arc::new(
+        channels
+            .iter()
+            .map(|ch| (ch.name().to_string(), Arc::clone(ch)))
+            .collect::<HashMap<_, _>>(),
+    );
+    let max_in_flight_messages = compute_max_in_flight_messages(channels.len());
 
-        // Auto-save to memory
-        if config.memory.auto_save {
-            let _ = mem
-                .store(
-                    &format!("{}_{}", msg.channel, msg.sender),
-                    &msg.content,
-                    crate::memory::MemoryCategory::Conversation,
-                )
-                .await;
-        }
+    println!("  🚦 In-flight message limit: {max_in_flight_messages}");
 
         // Use full agent (tools, peripherals) when hardware is configured; otherwise simple chat
         let use_agent = config.peripherals.enabled && !config.peripherals.boards.is_empty();
@@ -839,6 +1040,11 @@ pub async fn start_channels(config: Config) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::memory::{Memory, MemoryCategory, SqliteMemory};
+    use crate::observability::NoopObserver;
+    use crate::providers::{ChatMessage, ChatResponse, Provider, ToolCall};
+    use crate::tools::{Tool, ToolResult};
+    use std::collections::HashMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use tempfile::TempDir;
@@ -862,6 +1068,282 @@ mod tests {
         .unwrap();
         std::fs::write(tmp.path().join("MEMORY.md"), "# Memory\nUser likes Rust.").unwrap();
         tmp
+    }
+
+    #[derive(Default)]
+    struct RecordingChannel {
+        sent_messages: tokio::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Channel for RecordingChannel {
+        fn name(&self) -> &str {
+            "test-channel"
+        }
+
+        async fn send(&self, message: &str, recipient: &str) -> anyhow::Result<()> {
+            self.sent_messages
+                .lock()
+                .await
+                .push(format!("{recipient}:{message}"));
+            Ok(())
+        }
+
+        async fn listen(
+            &self,
+            _tx: tokio::sync::mpsc::Sender<traits::ChannelMessage>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct SlowProvider {
+        delay: Duration,
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for SlowProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<ChatResponse> {
+            tokio::time::sleep(self.delay).await;
+            Ok(ChatResponse::with_text(format!("echo: {message}")))
+        }
+    }
+
+    struct ToolCallingProvider;
+
+    fn tool_call_payload() -> ChatResponse {
+        ChatResponse {
+            text: Some(String::new()),
+            tool_calls: vec![ToolCall {
+                id: "call_1".into(),
+                name: "mock_price".into(),
+                arguments: r#"{"symbol":"BTC"}"#.into(),
+            }],
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for ToolCallingProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<ChatResponse> {
+            Ok(tool_call_payload())
+        }
+
+        async fn chat_with_history(
+            &self,
+            messages: &[ChatMessage],
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<ChatResponse> {
+            let has_tool_results = messages
+                .iter()
+                .any(|msg| msg.role == "user" && msg.content.contains("[Tool results]"));
+            if has_tool_results {
+                Ok(ChatResponse::with_text(
+                    "BTC is currently around $65,000 based on latest tool output.",
+                ))
+            } else {
+                Ok(tool_call_payload())
+            }
+        }
+    }
+
+    struct MockPriceTool;
+
+    #[async_trait::async_trait]
+    impl Tool for MockPriceTool {
+        fn name(&self) -> &str {
+            "mock_price"
+        }
+
+        fn description(&self) -> &str {
+            "Return a mocked BTC price"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "symbol": { "type": "string" }
+                },
+                "required": ["symbol"]
+            })
+        }
+
+        async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+            let symbol = args.get("symbol").and_then(serde_json::Value::as_str);
+            if symbol != Some("BTC") {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some("unexpected symbol".to_string()),
+                });
+            }
+
+            Ok(ToolResult {
+                success: true,
+                output: r#"{"symbol":"BTC","price_usd":65000}"#.to_string(),
+                error: None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn process_channel_message_executes_tool_calls_instead_of_sending_raw_json() {
+        let channel_impl = Arc::new(RecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            provider: Arc::new(ToolCallingProvider),
+            provider_name: Arc::new("test-provider".to_string()),
+            memory: Arc::new(NoopMemory),
+            tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("test-model".to_string()),
+            temperature: 0.0,
+            auto_save_memory: false,
+        });
+
+        process_channel_message(
+            runtime_ctx,
+            traits::ChannelMessage {
+                id: "msg-1".to_string(),
+                sender: "alice".to_string(),
+                content: "What is the BTC price now?".to_string(),
+                channel: "test-channel".to_string(),
+                timestamp: 1,
+            },
+        )
+        .await;
+
+        let sent_messages = channel_impl.sent_messages.lock().await;
+        assert_eq!(sent_messages.len(), 1);
+        assert!(sent_messages[0].contains("BTC is currently around"));
+        assert!(!sent_messages[0].contains("\"tool_calls\""));
+        assert!(!sent_messages[0].contains("mock_price"));
+    }
+
+    struct NoopMemory;
+
+    #[async_trait::async_trait]
+    impl Memory for NoopMemory {
+        fn name(&self) -> &str {
+            "noop"
+        }
+
+        async fn store(
+            &self,
+            _key: &str,
+            _content: &str,
+            _category: crate::memory::MemoryCategory,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn recall(
+            &self,
+            _query: &str,
+            _limit: usize,
+        ) -> anyhow::Result<Vec<crate::memory::MemoryEntry>> {
+            Ok(Vec::new())
+        }
+
+        async fn get(&self, _key: &str) -> anyhow::Result<Option<crate::memory::MemoryEntry>> {
+            Ok(None)
+        }
+
+        async fn list(
+            &self,
+            _category: Option<&crate::memory::MemoryCategory>,
+        ) -> anyhow::Result<Vec<crate::memory::MemoryEntry>> {
+            Ok(Vec::new())
+        }
+
+        async fn forget(&self, _key: &str) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+
+        async fn count(&self) -> anyhow::Result<usize> {
+            Ok(0)
+        }
+
+        async fn health_check(&self) -> bool {
+            true
+        }
+    }
+
+    #[tokio::test]
+    async fn message_dispatch_processes_messages_in_parallel() {
+        let channel_impl = Arc::new(RecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            provider: Arc::new(SlowProvider {
+                delay: Duration::from_millis(250),
+            }),
+            provider_name: Arc::new("test-provider".to_string()),
+            memory: Arc::new(NoopMemory),
+            tools_registry: Arc::new(vec![]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("test-model".to_string()),
+            temperature: 0.0,
+            auto_save_memory: false,
+        });
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(4);
+        tx.send(traits::ChannelMessage {
+            id: "1".to_string(),
+            sender: "alice".to_string(),
+            content: "hello".to_string(),
+            channel: "test-channel".to_string(),
+            timestamp: 1,
+        })
+        .await
+        .unwrap();
+        tx.send(traits::ChannelMessage {
+            id: "2".to_string(),
+            sender: "bob".to_string(),
+            content: "world".to_string(),
+            channel: "test-channel".to_string(),
+            timestamp: 2,
+        })
+        .await
+        .unwrap();
+        drop(tx);
+
+        let started = Instant::now();
+        run_message_dispatch_loop(rx, runtime_ctx, 2).await;
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < Duration::from_millis(430),
+            "expected parallel dispatch (<430ms), got {:?}",
+            elapsed
+        );
+
+        let sent_messages = channel_impl.sent_messages.lock().await;
+        assert_eq!(sent_messages.len(), 2);
     }
 
     #[test]
@@ -1057,11 +1539,117 @@ mod tests {
     }
 
     #[test]
+    fn channel_log_truncation_is_utf8_safe_for_multibyte_text() {
+        let msg = "Hello from ZeroClaw 🌍. Current status is healthy, and café-style UTF-8 text stays safe in logs.";
+
+        // Reproduces the production crash path where channel logs truncate at 80 chars.
+        let result = std::panic::catch_unwind(|| crate::util::truncate_with_ellipsis(msg, 80));
+        assert!(
+            result.is_ok(),
+            "truncate_with_ellipsis should never panic on UTF-8"
+        );
+
+        let truncated = result.unwrap();
+        assert!(!truncated.is_empty());
+        assert!(truncated.is_char_boundary(truncated.len()));
+    }
+
+    #[test]
     fn prompt_workspace_path() {
         let ws = make_workspace();
         let prompt = build_system_prompt(ws.path(), "model", &[], &[], None, None);
 
         assert!(prompt.contains(&format!("Working directory: `{}`", ws.path().display())));
+    }
+
+    #[test]
+    fn conversation_memory_key_uses_message_id() {
+        let msg = traits::ChannelMessage {
+            id: "msg_abc123".into(),
+            sender: "U123".into(),
+            content: "hello".into(),
+            channel: "slack".into(),
+            timestamp: 1,
+        };
+
+        assert_eq!(conversation_memory_key(&msg), "slack_U123_msg_abc123");
+    }
+
+    #[test]
+    fn conversation_memory_key_is_unique_per_message() {
+        let msg1 = traits::ChannelMessage {
+            id: "msg_1".into(),
+            sender: "U123".into(),
+            content: "first".into(),
+            channel: "slack".into(),
+            timestamp: 1,
+        };
+        let msg2 = traits::ChannelMessage {
+            id: "msg_2".into(),
+            sender: "U123".into(),
+            content: "second".into(),
+            channel: "slack".into(),
+            timestamp: 2,
+        };
+
+        assert_ne!(
+            conversation_memory_key(&msg1),
+            conversation_memory_key(&msg2)
+        );
+    }
+
+    #[tokio::test]
+    async fn autosave_keys_preserve_multiple_conversation_facts() {
+        let tmp = TempDir::new().unwrap();
+        let mem = SqliteMemory::new(tmp.path()).unwrap();
+
+        let msg1 = traits::ChannelMessage {
+            id: "msg_1".into(),
+            sender: "U123".into(),
+            content: "I'm Paul".into(),
+            channel: "slack".into(),
+            timestamp: 1,
+        };
+        let msg2 = traits::ChannelMessage {
+            id: "msg_2".into(),
+            sender: "U123".into(),
+            content: "I'm 45".into(),
+            channel: "slack".into(),
+            timestamp: 2,
+        };
+
+        mem.store(
+            &conversation_memory_key(&msg1),
+            &msg1.content,
+            MemoryCategory::Conversation,
+        )
+        .await
+        .unwrap();
+        mem.store(
+            &conversation_memory_key(&msg2),
+            &msg2.content,
+            MemoryCategory::Conversation,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(mem.count().await.unwrap(), 2);
+
+        let recalled = mem.recall("45", 5).await.unwrap();
+        assert!(recalled.iter().any(|entry| entry.content.contains("45")));
+    }
+
+    #[tokio::test]
+    async fn build_memory_context_includes_recalled_entries() {
+        let tmp = TempDir::new().unwrap();
+        let mem = SqliteMemory::new(tmp.path()).unwrap();
+        mem.store("age_fact", "Age is 45", MemoryCategory::Conversation)
+            .await
+            .unwrap();
+
+        let context = build_memory_context(&mem, "age").await;
+        assert!(context.contains("[Memory context]"));
+        assert!(context.contains("Age is 45"));
     }
 
     // ── AIEOS Identity Tests (Issue #168) ─────────────────────────

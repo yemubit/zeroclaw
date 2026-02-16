@@ -10,8 +10,14 @@
 use crate::channels::{Channel, WhatsAppChannel};
 use crate::config::Config;
 use crate::memory::{self, Memory, MemoryCategory};
-use crate::providers::{self, Provider};
-use crate::security::pairing::{constant_time_eq, is_public_bind, PairingGuard};
+use crate::observability::{self, Observer};
+use crate::providers::{self, ChatMessage, Provider};
+use crate::runtime;
+use crate::security::{
+    pairing::{constant_time_eq, is_public_bind, PairingGuard},
+    SecurityPolicy,
+};
+use crate::tools::{self, Tool};
 use crate::util::truncate_with_ellipsis;
 use anyhow::Result;
 use axum::{
@@ -28,6 +34,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::timeout::TimeoutLayer;
+use uuid::Uuid;
 
 /// Maximum request body size (64KB) — prevents memory exhaustion
 pub const MAX_BODY_SIZE: usize = 65_536;
@@ -35,6 +42,42 @@ pub const MAX_BODY_SIZE: usize = 65_536;
 pub const REQUEST_TIMEOUT_SECS: u64 = 30;
 /// Sliding window used by gateway rate limiting.
 pub const RATE_LIMIT_WINDOW_SECS: u64 = 60;
+
+fn webhook_memory_key() -> String {
+    format!("webhook_msg_{}", Uuid::new_v4())
+}
+
+fn whatsapp_memory_key(msg: &crate::channels::traits::ChannelMessage) -> String {
+    format!("whatsapp_{}_{}", msg.sender, msg.id)
+}
+
+fn normalize_gateway_reply(reply: String) -> String {
+    if reply.trim().is_empty() {
+        return "Model returned an empty response.".to_string();
+    }
+
+    reply
+}
+
+async fn gateway_agent_reply(state: &AppState, message: &str) -> Result<String> {
+    let mut history = vec![
+        ChatMessage::system(state.system_prompt.as_str()),
+        ChatMessage::user(message),
+    ];
+
+    let reply = crate::agent::loop_::run_tool_call_loop(
+        state.provider.as_ref(),
+        &mut history,
+        state.tools_registry.as_ref(),
+        state.observer.as_ref(),
+        "gateway",
+        &state.model,
+        state.temperature,
+    )
+    .await?;
+
+    Ok(normalize_gateway_reply(reply))
+}
 
 #[derive(Debug)]
 struct SlidingWindowRateLimiter {
@@ -150,6 +193,9 @@ fn client_key_from_headers(headers: &HeaderMap) -> String {
 #[derive(Clone)]
 pub struct AppState {
     pub provider: Arc<dyn Provider>,
+    pub observer: Arc<dyn Observer>,
+    pub tools_registry: Arc<Vec<Box<dyn Tool>>>,
+    pub system_prompt: Arc<String>,
     pub model: String,
     pub temperature: f64,
     pub mem: Arc<dyn Memory>,
@@ -189,13 +235,56 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
     let model = config
         .default_model
         .clone()
-        .unwrap_or_else(|| "anthropic/claude-sonnet-4-20250514".into());
+        .unwrap_or_else(|| "anthropic/claude-sonnet-4".into());
     let temperature = config.default_temperature;
     let mem: Arc<dyn Memory> = Arc::from(memory::create_memory(
         &config.memory,
         &config.workspace_dir,
         config.api_key.as_deref(),
     )?);
+    let observer: Arc<dyn Observer> =
+        Arc::from(observability::create_observer(&config.observability));
+    let runtime: Arc<dyn runtime::RuntimeAdapter> =
+        Arc::from(runtime::create_runtime(&config.runtime)?);
+    let security = Arc::new(SecurityPolicy::from_config(
+        &config.autonomy,
+        &config.workspace_dir,
+    ));
+
+    let composio_key = if config.composio.enabled {
+        config.composio.api_key.as_deref()
+    } else {
+        None
+    };
+
+    let tools_registry = Arc::new(tools::all_tools_with_runtime(
+        &security,
+        runtime,
+        Arc::clone(&mem),
+        composio_key,
+        &config.browser,
+        &config.http_request,
+        &config.workspace_dir,
+        &config.agents,
+        config.api_key.as_deref(),
+    ));
+    let skills = crate::skills::load_skills(&config.workspace_dir);
+    let tool_descs: Vec<(&str, &str)> = tools_registry
+        .iter()
+        .map(|tool| (tool.name(), tool.description()))
+        .collect();
+
+    let mut system_prompt = crate::channels::build_system_prompt(
+        &config.workspace_dir,
+        &model,
+        &tool_descs,
+        &skills,
+        Some(&config.identity),
+    );
+    system_prompt.push_str(&crate::agent::loop_::build_tool_instructions(
+        tools_registry.as_ref(),
+    ));
+    let system_prompt = Arc::new(system_prompt);
 
     // Extract webhook secret for authentication
     let webhook_secret: Option<Arc<str>> = config
@@ -299,6 +388,9 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
     // Build shared state
     let state = AppState {
         provider,
+        observer,
+        tools_registry,
+        system_prompt,
         model,
         temperature,
         mem,
@@ -475,19 +567,16 @@ async fn handle_webhook(
     let message = &webhook_body.message;
 
     if state.auto_save {
+        let key = webhook_memory_key();
         let _ = state
             .mem
-            .store("webhook_msg", message, MemoryCategory::Conversation)
+            .store(&key, message, MemoryCategory::Conversation)
             .await;
     }
 
-    match state
-        .provider
-        .chat(message, &state.model, state.temperature)
-        .await
-    {
-        Ok(response) => {
-            let body = serde_json::json!({"response": response, "model": state.model});
+    match gateway_agent_reply(&state, message).await {
+        Ok(reply) => {
+            let body = serde_json::json!({"response": reply, "model": state.model});
             (StatusCode::OK, Json(body))
         }
         Err(e) => {
@@ -627,25 +716,18 @@ async fn handle_whatsapp_message(
 
         // Auto-save to memory
         if state.auto_save {
+            let key = whatsapp_memory_key(msg);
             let _ = state
                 .mem
-                .store(
-                    &format!("whatsapp_{}", msg.sender),
-                    &msg.content,
-                    MemoryCategory::Conversation,
-                )
+                .store(&key, &msg.content, MemoryCategory::Conversation)
                 .await;
         }
 
         // Call the LLM
-        match state
-            .provider
-            .chat(&msg.content, &state.model, state.temperature)
-            .await
-        {
-            Ok(response) => {
+        match gateway_agent_reply(&state, &msg.content).await {
+            Ok(reply) => {
                 // Send reply via WhatsApp
-                if let Err(e) = wa.send(&response, &msg.sender).await {
+                if let Err(e) = wa.send(&reply, &msg.sender).await {
                     tracing::error!("Failed to send WhatsApp reply: {e}");
                 }
             }
@@ -668,6 +750,7 @@ async fn handle_whatsapp_message(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::channels::traits::ChannelMessage;
     use crate::memory::{Memory, MemoryCategory, MemoryEntry};
     use crate::providers::Provider;
     use async_trait::async_trait;
@@ -675,6 +758,7 @@ mod tests {
     use axum::response::IntoResponse;
     use http_body_util::BodyExt;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
 
     #[test]
     fn security_body_limit_is_64kb() {
@@ -728,6 +812,30 @@ mod tests {
         assert!(store.record_if_new("req-1"));
         assert!(!store.record_if_new("req-1"));
         assert!(store.record_if_new("req-2"));
+    }
+
+    #[test]
+    fn webhook_memory_key_is_unique() {
+        let key1 = webhook_memory_key();
+        let key2 = webhook_memory_key();
+
+        assert!(key1.starts_with("webhook_msg_"));
+        assert!(key2.starts_with("webhook_msg_"));
+        assert_ne!(key1, key2);
+    }
+
+    #[test]
+    fn whatsapp_memory_key_includes_sender_and_message_id() {
+        let msg = ChannelMessage {
+            id: "wamid-123".into(),
+            sender: "+1234567890".into(),
+            content: "hello".into(),
+            channel: "whatsapp".into(),
+            timestamp: 1,
+        };
+
+        let key = whatsapp_memory_key(&msg);
+        assert_eq!(key, "whatsapp_+1234567890_wamid-123");
     }
 
     #[derive(Default)]
@@ -789,9 +897,89 @@ mod tests {
             _message: &str,
             _model: &str,
             _temperature: f64,
-        ) -> anyhow::Result<String> {
+        ) -> anyhow::Result<crate::providers::ChatResponse> {
             self.calls.fetch_add(1, Ordering::SeqCst);
-            Ok("ok".into())
+            Ok(crate::providers::ChatResponse::with_text("ok"))
+        }
+    }
+
+    #[derive(Default)]
+    struct TrackingMemory {
+        keys: Mutex<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl Memory for TrackingMemory {
+        fn name(&self) -> &str {
+            "tracking"
+        }
+
+        async fn store(
+            &self,
+            key: &str,
+            _content: &str,
+            _category: MemoryCategory,
+        ) -> anyhow::Result<()> {
+            self.keys
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(key.to_string());
+            Ok(())
+        }
+
+        async fn recall(&self, _query: &str, _limit: usize) -> anyhow::Result<Vec<MemoryEntry>> {
+            Ok(Vec::new())
+        }
+
+        async fn get(&self, _key: &str) -> anyhow::Result<Option<MemoryEntry>> {
+            Ok(None)
+        }
+
+        async fn list(
+            &self,
+            _category: Option<&MemoryCategory>,
+        ) -> anyhow::Result<Vec<MemoryEntry>> {
+            Ok(Vec::new())
+        }
+
+        async fn forget(&self, _key: &str) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+
+        async fn count(&self) -> anyhow::Result<usize> {
+            let size = self
+                .keys
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len();
+            Ok(size)
+        }
+
+        async fn health_check(&self) -> bool {
+            true
+        }
+    }
+
+    fn test_app_state(
+        provider: Arc<dyn Provider>,
+        memory: Arc<dyn Memory>,
+        auto_save: bool,
+    ) -> AppState {
+        AppState {
+            provider,
+            observer: Arc::new(crate::observability::NoopObserver),
+            tools_registry: Arc::new(Vec::new()),
+            system_prompt: Arc::new("test-system-prompt".into()),
+            model: "test-model".into(),
+            temperature: 0.0,
+            mem: memory,
+            auto_save,
+            webhook_secret: None,
+            pairing: Arc::new(PairingGuard::new(false, &[])),
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100)),
+            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300))),
+            whatsapp: None,
+            whatsapp_app_secret: None,
         }
     }
 
@@ -801,19 +989,7 @@ mod tests {
         let provider: Arc<dyn Provider> = provider_impl.clone();
         let memory: Arc<dyn Memory> = Arc::new(MockMemory);
 
-        let state = AppState {
-            provider,
-            model: "test-model".into(),
-            temperature: 0.0,
-            mem: memory,
-            auto_save: false,
-            webhook_secret: None,
-            pairing: Arc::new(PairingGuard::new(false, &[])),
-            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100)),
-            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300))),
-            whatsapp: None,
-            whatsapp_app_secret: None,
-        };
+        let state = test_app_state(provider, memory, false);
 
         let mut headers = HeaderMap::new();
         headers.insert("X-Idempotency-Key", HeaderValue::from_static("abc-123"));
@@ -839,6 +1015,150 @@ mod tests {
         assert_eq!(parsed["status"], "duplicate");
         assert_eq!(parsed["idempotent"], true);
         assert_eq!(provider_impl.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn webhook_autosave_stores_distinct_keys_per_request() {
+        let provider_impl = Arc::new(MockProvider::default());
+        let provider: Arc<dyn Provider> = provider_impl.clone();
+
+        let tracking_impl = Arc::new(TrackingMemory::default());
+        let memory: Arc<dyn Memory> = tracking_impl.clone();
+
+        let state = test_app_state(provider, memory, true);
+
+        let headers = HeaderMap::new();
+
+        let body1 = Ok(Json(WebhookBody {
+            message: "hello one".into(),
+        }));
+        let first = handle_webhook(State(state.clone()), headers.clone(), body1)
+            .await
+            .into_response();
+        assert_eq!(first.status(), StatusCode::OK);
+
+        let body2 = Ok(Json(WebhookBody {
+            message: "hello two".into(),
+        }));
+        let second = handle_webhook(State(state), headers, body2)
+            .await
+            .into_response();
+        assert_eq!(second.status(), StatusCode::OK);
+
+        let keys = tracking_impl
+            .keys
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        assert_eq!(keys.len(), 2);
+        assert_ne!(keys[0], keys[1]);
+        assert!(keys[0].starts_with("webhook_msg_"));
+        assert!(keys[1].starts_with("webhook_msg_"));
+        assert_eq!(provider_impl.calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[derive(Default)]
+    struct StructuredToolCallProvider {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl Provider for StructuredToolCallProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<crate::providers::ChatResponse> {
+            let turn = self.calls.fetch_add(1, Ordering::SeqCst);
+
+            if turn == 0 {
+                return Ok(crate::providers::ChatResponse {
+                    text: Some("Running tool...".into()),
+                    tool_calls: vec![crate::providers::ToolCall {
+                        id: "call_1".into(),
+                        name: "mock_tool".into(),
+                        arguments: r#"{"query":"gateway"}"#.into(),
+                    }],
+                });
+            }
+
+            Ok(crate::providers::ChatResponse::with_text(
+                "Gateway tool result ready.",
+            ))
+        }
+    }
+
+    struct MockTool {
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl Tool for MockTool {
+        fn name(&self) -> &str {
+            "mock_tool"
+        }
+
+        fn description(&self) -> &str {
+            "Mock tool for gateway tests"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"}
+                },
+                "required": ["query"]
+            })
+        }
+
+        async fn execute(
+            &self,
+            args: serde_json::Value,
+        ) -> anyhow::Result<crate::tools::ToolResult> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            assert_eq!(args["query"], "gateway");
+
+            Ok(crate::tools::ToolResult {
+                success: true,
+                output: "ok".into(),
+                error: None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn webhook_executes_structured_tool_calls() {
+        let provider_impl = Arc::new(StructuredToolCallProvider::default());
+        let provider: Arc<dyn Provider> = provider_impl.clone();
+        let memory: Arc<dyn Memory> = Arc::new(MockMemory);
+
+        let tool_calls = Arc::new(AtomicUsize::new(0));
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(MockTool {
+            calls: Arc::clone(&tool_calls),
+        })];
+
+        let mut state = test_app_state(provider, memory, false);
+        state.tools_registry = Arc::new(tools);
+
+        let response = handle_webhook(
+            State(state),
+            HeaderMap::new(),
+            Ok(Json(WebhookBody {
+                message: "please use tool".into(),
+            })),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload = response.into_body().collect().await.unwrap().to_bytes();
+        let parsed: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+        assert_eq!(parsed["response"], "Gateway tool result ready.");
+        assert_eq!(tool_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(provider_impl.calls.load(Ordering::SeqCst), 2);
     }
 
     // ══════════════════════════════════════════════════════════
